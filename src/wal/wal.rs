@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::Hasher;
 
 use super::header::{Header, HEADER_SIZE};
-use super::Error;
+use crate::Error;
 
 // Represents a key-value pair or a delete operation in the WAL
 
@@ -237,7 +237,7 @@ impl Iterator for ReplayIterator {
 #[cfg(test)]
 mod tests {
     use super::Wal;
-    use crate::wal::{header::HEADER_SIZE, Error};
+    use crate::{wal::header::HEADER_SIZE, Error};
     use std::{
         fs::File,
         io::{Read, Seek, SeekFrom, Write},

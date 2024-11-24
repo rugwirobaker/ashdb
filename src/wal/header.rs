@@ -1,7 +1,7 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
-use super::Error;
+use crate::error::Error;
 
 // 14 bytes
 pub const HEADER_SIZE: usize = 22;
