@@ -1,3 +1,6 @@
+use crate::error::Result;
+use crate::{wal::wal::Wal, Error};
+use crossbeam_skiplist::{map::Entry, SkipMap};
 use std::{
     ops::{Bound, RangeBounds},
     path::Path,
@@ -6,10 +9,6 @@ use std::{
         Arc, Mutex,
     },
 };
-
-use crossbeam_skiplist::SkipMap;
-
-use crate::{wal::wal::Wal, Error};
 
 #[derive(Debug)]
 pub struct Memtable {
@@ -22,7 +21,7 @@ pub struct Memtable {
 
 impl Memtable {
     /// Creates a new empty Memtable with a new WAL.
-    pub fn new(dir: &str, id: u64) -> Result<Self, Error> {
+    pub fn new(dir: &str, id: u64) -> Result<Self> {
         let dir_path = Path::new(dir);
         if !dir_path.exists() {
             std::fs::create_dir_all(dir_path).map_err(|e| {
@@ -46,7 +45,7 @@ impl Memtable {
         })
     }
 
-    pub fn from_wal(wal: Wal) -> Result<Self, Error> {
+    pub fn from_wal(wal: Wal) -> Result<Self> {
         let data = Arc::new(SkipMap::new());
         let size = AtomicUsize::new(0);
         let id = wal.id()?;
@@ -73,7 +72,7 @@ impl Memtable {
 
 impl Memtable {
     /// Inserts or updates a key-value pair in the Memtable.
-    pub fn put(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<(), Error> {
+    pub fn put(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
         if self.is_frozen.load(Ordering::SeqCst) {
             return Err(Error::Frozen);
         }
@@ -113,7 +112,7 @@ impl Memtable {
     }
 
     /// freeze prevents further writes to the Memtable.
-    pub fn freeze(&self) -> Result<(), Error> {
+    pub fn freeze(&self) -> Result<()> {
         if self.is_frozen.swap(true, Ordering::SeqCst) {
             return Err(Error::Frozen);
         }
@@ -121,63 +120,54 @@ impl Memtable {
     }
 
     // Scan range of keys
-    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter, Error> {
-        let start_bound = match range.start_bound() {
-            Bound::Included(key) => Bound::Included(key.clone()),
-            Bound::Excluded(key) => Bound::Excluded(key.clone()),
-            Bound::Unbounded => Bound::Unbounded,
+    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter> {
+        // Extract start and end bounds from the range
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(key) => std::ops::Bound::Included(key.clone()),
+            std::ops::Bound::Excluded(key) => std::ops::Bound::Excluded(key.clone()),
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
         };
 
-        let end_bound = match range.end_bound() {
-            Bound::Included(key) => Bound::Included(key.clone()),
-            Bound::Excluded(key) => Bound::Excluded(key.clone()),
-            Bound::Unbounded => Bound::Unbounded,
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(key) => std::ops::Bound::Included(key.clone()),
+            std::ops::Bound::Excluded(key) => std::ops::Bound::Excluded(key.clone()),
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
         };
 
-        let iterator = self
-            .data
-            .range((start_bound, end_bound))
-            .map(|entry| (entry.key().clone(), entry.value().clone()));
-
+        // Create a Range with explicit bounds
+        let skipmap_range = self.data.range((start, end));
         Ok(ScanIter {
-            inner: Box::new(iterator),
-        })
-    }
-
-    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<ScanIter, Error> {
-        let start_key = prefix.to_vec();
-        let end_key = {
-            let mut end = prefix.to_vec();
-            for i in (0..end.len()).rev() {
-                if end[i] < u8::MAX {
-                    end[i] += 1;
-                    end.truncate(i + 1);
-                    break;
-                }
-            }
-            end
-        };
-
-        let iterator = self
-            .data
-            .range(start_key..end_key)
-            .map(|entry| (entry.key().clone(), entry.value().clone()));
-
-        Ok(ScanIter {
-            inner: Box::new(iterator),
+            inner: skipmap_range,
         })
     }
 }
 
+type SkipMapRange<'a> = crossbeam_skiplist::map::Range<
+    'a,
+    Vec<u8>,
+    (Bound<Vec<u8>>, Bound<Vec<u8>>),
+    Vec<u8>,
+    Option<Vec<u8>>,
+>;
+
 pub struct ScanIter<'a> {
-    inner: Box<dyn Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + 'a>,
+    inner: SkipMapRange<'a>,
+}
+
+impl<'a> ScanIter<'a> {
+    /// Maps a SkipMap Entry to the expected output format.
+    fn map(entry: Entry<'_, Vec<u8>, Option<Vec<u8>>>) -> <Self as Iterator>::Item {
+        let key = entry.key();
+        let value = entry.value();
+        Ok((key.clone(), value.clone().unwrap_or_default()))
+    }
 }
 
 impl<'a> Iterator for ScanIter<'a> {
-    type Item = (Vec<u8>, Option<Vec<u8>>);
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.inner.next().map(Self::map)
     }
 }
 
@@ -297,41 +287,19 @@ mod tests {
             .scan(b"key1".to_vec()..=b"key2".to_vec())
             .expect("Scan failed");
 
-        assert_eq!(
-            scan_iter.next(),
-            Some((b"key1".to_vec(), Some(b"value1".to_vec())))
-        );
-        assert_eq!(
-            scan_iter.next(),
-            Some((b"key2".to_vec(), Some(b"value2".to_vec())))
-        );
-        assert_eq!(scan_iter.next(), None);
-    }
+        // Pull values out and compare them
+        let first = scan_iter
+            .next()
+            .expect("Expected first result")
+            .expect("Error in first result");
+        assert_eq!(first, (b"key1".to_vec(), b"value1".to_vec()));
 
-    #[test]
-    fn test_scan_prefix() {
-        let temp_dir = create_temp_dir();
-        let memtable = create_temp_memtable(&temp_dir);
+        let second = scan_iter
+            .next()
+            .expect("Expected second result")
+            .expect("Error in second result");
+        assert_eq!(second, (b"key2".to_vec(), b"value2".to_vec()));
 
-        // Insert key-value pairs
-        memtable
-            .put(b"key1".to_vec(), Some(b"value1".to_vec()))
-            .expect("Put failed");
-        memtable
-            .put(b"key2".to_vec(), Some(b"value2".to_vec()))
-            .expect("Put failed");
-        memtable
-            .put(b"other_key".to_vec(), Some(b"value3".to_vec()))
-            .expect("Put failed");
-
-        // Scan a prefix
-        let entries: Vec<_> = memtable
-            .scan_prefix(b"key")
-            .expect("Scan prefix failed")
-            .collect();
-
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0], (b"key1".to_vec(), Some(b"value1".to_vec())));
-        assert_eq!(entries[1], (b"key2".to_vec(), Some(b"value2".to_vec())));
+        assert!(scan_iter.next().is_none(), "Expected no more results");
     }
 }
