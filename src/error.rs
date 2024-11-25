@@ -12,6 +12,7 @@ pub enum Error {
     MutexPoisoned, // From WAL-related concurrency handling
     KeyNotFound,   // From LSM store
     Frozen,
+    InvalidWalId(String),
 }
 
 impl From<io::Error> for Error {
@@ -33,6 +34,7 @@ impl std::fmt::Display for Error {
             Error::MutexPoisoned => write!(f, "Mutex was poisoned"),
             Error::Frozen => write!(f, "Memtable is frozen"),
             Error::KeyNotFound => write!(f, "Key not found"),
+            Error::InvalidWalId(msg) => write!(f, "Invalid WAL ID: {}", msg),
         }
     }
 }

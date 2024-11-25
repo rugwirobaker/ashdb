@@ -1,5 +1,6 @@
 use std::{
     ops::{Bound, RangeBounds},
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -12,6 +13,7 @@ use crate::{wal::wal::Wal, Error};
 
 #[derive(Debug)]
 pub struct Memtable {
+    id: u64,
     data: Arc<SkipMap<Vec<u8>, Option<Vec<u8>>>>, // In-memory key-value store
     wal: Arc<Mutex<Wal>>,                         // Associated Write-Ahead Log
     size: AtomicUsize,                            // Tracks Memtable size
@@ -20,11 +22,23 @@ pub struct Memtable {
 
 impl Memtable {
     /// Creates a new empty Memtable with a new WAL.
-    pub fn new(wal_path: &str) -> Result<Self, Error> {
-        // Create a new WAL
-        let wal = Wal::new(wal_path)?;
+    pub fn new(dir: &str, id: u64) -> Result<Self, Error> {
+        let dir_path = Path::new(dir);
+        if !dir_path.exists() {
+            std::fs::create_dir_all(dir_path).map_err(|e| {
+                Error::IoError(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to create dir: {}", dir),
+                ))
+            })?;
+        }
+        let wal_path = dir_path.join(format!("{:04}.wal", id));
+        let wal = Wal::new(wal_path.to_str().ok_or_else(|| {
+            Error::InvalidWalId("Failed to convert WAL path to string".to_string())
+        })?)?;
 
         Ok(Self {
+            id,
             data: Arc::new(SkipMap::new()),
             wal: Arc::new(Mutex::new(wal)),
             size: AtomicUsize::new(0),
@@ -35,7 +49,9 @@ impl Memtable {
     pub fn from_wal(wal: Wal) -> Result<Self, Error> {
         let data = Arc::new(SkipMap::new());
         let size = AtomicUsize::new(0);
+        let id = wal.id()?;
 
+        // Clone the WAL file for replay
         let replay_iter = wal.replay()?;
         for entry in replay_iter {
             let (key, value) = entry?;
@@ -47,9 +63,10 @@ impl Memtable {
 
         Ok(Self {
             data,
-            wal: Arc::new(Mutex::new(wal)),
+            wal: Arc::new(Mutex::new(wal)), // Ensure WAL is still usable elsewhere
             size,
             is_frozen: AtomicBool::new(false),
+            id: id,
         })
     }
 }
@@ -90,6 +107,12 @@ impl Memtable {
         self.size.load(Ordering::SeqCst)
     }
 
+    /// id returns the ID of the Memtable.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// freeze prevents further writes to the Memtable.
     pub fn freeze(&self) -> Result<(), Error> {
         if self.is_frozen.swap(true, Ordering::SeqCst) {
             return Err(Error::Frozen);
@@ -161,21 +184,28 @@ impl<'a> Iterator for ScanIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
-    fn create_temp_memtable() -> Memtable {
-        let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
-        Memtable::new(temp_file.path().to_str().unwrap()).expect("Failed to initialize Memtable")
+    fn create_temp_dir() -> TempDir {
+        TempDir::new().expect("Failed to create temporary directory")
     }
 
-    fn create_temp_wal() -> Wal {
-        let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
-        Wal::new(temp_file.path().to_str().unwrap()).expect("Failed to initialize WAL")
+    fn create_temp_memtable(temp_dir: &TempDir) -> Memtable {
+        let wal_path = temp_dir.path().join("0000.wal");
+        Memtable::new(wal_path.to_str().expect("Failed to create WAL path"), 0)
+            .expect("Failed to initialize Memtable")
+    }
+
+    fn create_temp_wal(temp_dir: &TempDir) -> Wal {
+        let wal_path = temp_dir.path().join("0000.wal");
+        Wal::new(wal_path.to_str().expect("Failed to create WAL path"))
+            .expect("Failed to initialize WAL")
     }
 
     #[test]
     fn test_put_and_get() {
-        let memtable = create_temp_memtable();
+        let temp_dir = create_temp_dir();
+        let memtable = create_temp_memtable(&temp_dir);
 
         // Add key-value pairs
         memtable
@@ -197,7 +227,9 @@ mod tests {
 
     #[test]
     fn test_freeze_twice() {
-        let memtable = create_temp_memtable();
+        let temp_dir = create_temp_dir();
+        let memtable = create_temp_memtable(&temp_dir);
+
         // Freeze the Memtable once
         memtable.freeze().expect("Failed to freeze Memtable");
         // Attempt to freeze it again and verify the error
@@ -206,7 +238,9 @@ mod tests {
 
     #[test]
     fn test_put_to_frozen_memtable() {
-        let memtable = create_temp_memtable();
+        let temp_dir = create_temp_dir();
+        let memtable = create_temp_memtable(&temp_dir);
+
         // Freeze the Memtable
         memtable.freeze().expect("Failed to freeze Memtable");
         // Attempt to write and verify the error
@@ -218,7 +252,8 @@ mod tests {
 
     #[test]
     fn test_from_wal() {
-        let mut wal = create_temp_wal();
+        let temp_dir = create_temp_dir();
+        let mut wal = create_temp_wal(&temp_dir);
 
         // Append some key-value pairs
         wal.put(b"key1", Some(b"value1")).expect("Failed to append");
@@ -241,7 +276,10 @@ mod tests {
 
     #[test]
     fn test_scan() {
-        let memtable = create_temp_memtable();
+        let temp_dir = create_temp_dir();
+        println!("TempDir path: {}", temp_dir.path().display());
+
+        let memtable = create_temp_memtable(&temp_dir);
 
         // Insert key-value pairs
         memtable
@@ -272,7 +310,8 @@ mod tests {
 
     #[test]
     fn test_scan_prefix() {
-        let memtable = create_temp_memtable();
+        let temp_dir = create_temp_dir();
+        let memtable = create_temp_memtable(&temp_dir);
 
         // Insert key-value pairs
         memtable

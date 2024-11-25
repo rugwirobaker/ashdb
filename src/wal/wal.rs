@@ -58,6 +58,16 @@ impl Wal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Returns the numeric ID of the WAL file, derived from its file name.
+    pub fn id(&self) -> Result<u64, Error> {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.split('.').next())
+            .and_then(|num| num.parse::<u64>().ok())
+            .ok_or_else(|| Error::InvalidWalId(format!("Invalid WAL file name: {:?}", self.path)))
+    }
 }
 
 impl Wal {
@@ -238,10 +248,7 @@ impl Iterator for ReplayIterator {
 mod tests {
     use super::Wal;
     use crate::{wal::header::HEADER_SIZE, Error};
-    use std::{
-        fs::File,
-        io::{Read, Seek, SeekFrom, Write},
-    };
+    use std::io::{Seek, SeekFrom, Write};
     use tempfile::NamedTempFile;
 
     fn create_temp_wal() -> Wal {
@@ -362,23 +369,6 @@ mod tests {
             wal.validate_checksum().is_err(),
             "Checksum validation passed for corrupted WAL"
         );
-    }
-
-    #[test]
-    fn debug_wal_contents() {
-        let mut wal = Wal::new("test_wal").expect("Failed to create WAL");
-
-        // Append entries
-        wal.put(b"key1", Some(b"value1")).expect("Failed to append");
-        wal.put(b"key2", Some(b"value2")).expect("Failed to append");
-        wal.sync().expect("Failed to sync");
-
-        // Print WAL contents
-        let mut file = File::open(wal.path()).expect("Failed to open WAL file");
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)
-            .expect("Failed to read WAL file");
-        println!("WAL Contents: {:?}", contents);
     }
 
     #[test]
