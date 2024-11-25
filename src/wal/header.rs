@@ -1,7 +1,7 @@
+use crate::error::Result;
+use crate::Error;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
-
-use crate::error::Error;
 
 // 14 bytes
 pub const HEADER_SIZE: usize = 22;
@@ -29,7 +29,7 @@ impl Header {
 impl TryInto<Vec<u8>> for Header {
     type Error = Error;
 
-    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+    fn try_into(self) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(HEADER_SIZE);
         let mut encoder = HeaderEncoder::new(&mut buf);
         encoder.encode(&self)?;
@@ -40,7 +40,7 @@ impl TryInto<Vec<u8>> for Header {
 impl TryInto<Vec<u8>> for &Header {
     type Error = Error;
 
-    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+    fn try_into(self) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(HEADER_SIZE);
         let mut encoder = HeaderEncoder::new(&mut buf);
         encoder.encode(self)?;
@@ -51,7 +51,7 @@ impl TryInto<Vec<u8>> for &Header {
 impl TryFrom<&[u8]> for Header {
     type Error = Error;
 
-    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+    fn try_from(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < HEADER_SIZE {
             return Err(Error::InvalidHeader);
         }
@@ -64,7 +64,7 @@ impl TryFrom<&[u8]> for Header {
 impl TryFrom<&Vec<u8>> for Header {
     type Error = Error;
 
-    fn try_from(value: &Vec<u8>) -> Result<Self, Self::Error> {
+    fn try_from(value: &Vec<u8>) -> Result<Self> {
         Header::try_from(value.as_slice())
     }
 }
@@ -79,7 +79,7 @@ impl<R: Read> HeaderDecoder<R> {
         HeaderDecoder { reader }
     }
 
-    pub fn decode(&mut self) -> Result<Header, Error> {
+    pub fn decode(&mut self) -> Result<Header> {
         let magic_number = self
             .reader
             .read_u32::<BigEndian>()
@@ -119,7 +119,7 @@ impl<W: Write> HeaderEncoder<W> {
         HeaderEncoder { writer }
     }
 
-    pub fn encode(&mut self, header: &Header) -> Result<(), Error> {
+    pub fn encode(&mut self, header: &Header) -> Result<()> {
         self.writer
             .write_u32::<BigEndian>(header.magic_number)
             .map_err(|e| Error::Encode("magic_number", e))?;

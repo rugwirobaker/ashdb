@@ -1,11 +1,10 @@
+use super::header::{Header, HEADER_SIZE};
+use crate::error::Result;
+use crate::Error;
+use crate::Hasher;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-
-use crate::Hasher;
-
-use super::header::{Header, HEADER_SIZE};
-use crate::Error;
 
 // Represents a key-value pair or a delete operation in the WAL
 
@@ -19,7 +18,7 @@ pub struct Wal {
 }
 
 impl Wal {
-    pub fn new(path: &str) -> Result<Self, Error> {
+    pub fn new(path: &str) -> Result<Self> {
         let path = PathBuf::from(path);
 
         let file = File::options()
@@ -60,7 +59,7 @@ impl Wal {
     }
 
     /// Returns the numeric ID of the WAL file, derived from its file name.
-    pub fn id(&self) -> Result<u64, Error> {
+    pub fn id(&self) -> Result<u64> {
         self.path
             .file_name()
             .and_then(|name| name.to_str())
@@ -72,7 +71,7 @@ impl Wal {
 
 impl Wal {
     /// Appends a key-value pair to the WAL file.
-    pub fn put(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<(), Error> {
+    pub fn put(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         let key_length = (key.len() as u32).to_be_bytes();
         let value_data = value.unwrap_or(&[]);
         let value_length = (value_data.len() as u32).to_be_bytes();
@@ -93,13 +92,13 @@ impl Wal {
     }
 
     /// Replays the WAL file and returns a list of key-value pairs.
-    pub fn replay(&self) -> Result<ReplayIterator, Error> {
+    pub fn replay(&self) -> Result<ReplayIterator> {
         let reader = BufReader::new(self.file.try_clone()?);
         ReplayIterator::new(reader)
     }
 
     /// Syncs the WAL file to disk.
-    pub fn sync(&mut self) -> Result<(), Error> {
+    pub fn sync(&mut self) -> Result<()> {
         // Flush the writer to ensure all data is written
         self.writer.flush()?;
         self.file.sync_all()?; // Ensure durability on disk
@@ -113,7 +112,7 @@ impl Wal {
 
         Ok(())
     }
-    pub fn validate_checksum(&self) -> Result<(), Error> {
+    pub fn validate_checksum(&self) -> Result<()> {
         let mut replay = ReplayIterator::new(BufReader::new(self.file.try_clone()?))?;
         while let Some(entry) = replay.next() {
             entry?; // Process entries to compute checksum
@@ -137,7 +136,7 @@ pub struct ReplayIterator {
 }
 
 impl ReplayIterator {
-    pub fn new(mut reader: BufReader<File>) -> Result<Self, Error> {
+    pub fn new(mut reader: BufReader<File>) -> Result<Self> {
         reader
             .get_mut()
             .seek(SeekFrom::Start(HEADER_SIZE as u64))
@@ -151,7 +150,7 @@ impl ReplayIterator {
 }
 impl ReplayIterator {
     /// Reads a key-value pair from the underlying WAL file.
-    fn read<R: Read>(reader: &mut R) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>, Error> {
+    fn read<R: Read>(reader: &mut R) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>> {
         let mut length_buf = [0u8; 4];
 
         // Read key length
@@ -220,7 +219,7 @@ impl ReplayIterator {
 }
 
 impl Iterator for ReplayIterator {
-    type Item = Result<(Vec<u8>, Option<Vec<u8>>), Error>;
+    type Item = Result<(Vec<u8>, Option<Vec<u8>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match ReplayIterator::read(&mut self.reader) {

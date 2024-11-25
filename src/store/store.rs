@@ -1,6 +1,5 @@
+use crate::error::Result;
 use std::ops::RangeBounds;
-
-use crate::Error;
 
 pub trait Store {
     /// The iterator returned by scan().
@@ -9,10 +8,10 @@ pub trait Store {
         Self: 'a;
 
     /// Inserts or updates a key-value pair.
-    fn set(&mut self, key: &[u8], value: Vec<u8>) -> Result<(), Error>;
+    fn set(&mut self, key: &[u8], value: Vec<u8>) -> Result<()>;
 
     /// Retrieves the value for a given key.
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Iterates over an ordered range of key-value pairs.
     fn scan<'a>(&'a self, range: impl RangeBounds<Vec<u8>> + 'a) -> Self::ScanIterator<'a>;
@@ -34,6 +33,6 @@ pub trait Store {
     }
 }
 
-pub trait ScanIterator: Iterator<Item = Result<(Vec<u8>, Vec<u8>), Error>> {}
+pub trait ScanIterator: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}
 
-impl<I> ScanIterator for I where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>), Error>> {}
+impl<I> ScanIterator for I where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}
