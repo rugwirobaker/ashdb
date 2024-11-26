@@ -10,6 +10,9 @@ use std::{
     },
 };
 
+// MAX_MEMTABLE_SIZE is the maximum size of the Memtable in bytes.
+pub const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024; // 64MB
+
 #[derive(Debug)]
 pub struct Memtable {
     id: u64,

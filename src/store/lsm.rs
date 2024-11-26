@@ -1,16 +1,41 @@
 use super::store::Store;
-use crate::{error::Result, memtable::Memtable};
-use std::ops::RangeBounds;
+use crate::{
+    error::Result,
+    memtable::{Memtable, MAX_MEMTABLE_SIZE},
+};
+use std::{ops::RangeBounds, sync::Arc};
 
 pub struct LsmStore {
-    memtable: Memtable, // Single active Memtable
+    dir: String,
+    active_memtable: Arc<Memtable>, // Current active Memtable with read/write access
+    frozen_memtables: Vec<Arc<Memtable>>, // Frozen Memtables
 }
 
 impl LsmStore {
     pub fn new(dir: &str) -> Result<Self> {
-        // Initialize the Memtable with ID 0
-        let memtable = Memtable::new(dir, 0)?;
-        Ok(Self { memtable })
+        let active_memtable = Memtable::new(dir, 0)?;
+        Ok(Self {
+            dir: dir.to_string(),
+            active_memtable: Arc::new(active_memtable),
+            frozen_memtables: Vec::new(),
+        })
+    }
+}
+
+impl LsmStore {
+    pub fn freeze_active_memtable(&mut self) -> Result<()> {
+        // Freeze the current active Memtable
+        self.active_memtable.freeze()?;
+        let frozen_memtable = Arc::clone(&self.active_memtable);
+
+        // Push the frozen Memtable to the frozen_memtables list
+        self.frozen_memtables.push(frozen_memtable);
+
+        // Create a new active Memtable
+        let new_memtable_id = self.frozen_memtables.len() as u64;
+        self.active_memtable = Arc::new(Memtable::new(&self.dir, new_memtable_id)?);
+
+        Ok(())
     }
 }
 
@@ -18,17 +43,38 @@ impl Store for LsmStore {
     type ScanIterator<'a> = ScanIterator<'a>;
 
     fn set(&mut self, key: &[u8], value: Vec<u8>) -> Result<()> {
-        self.memtable.put(key.to_vec(), Some(value))
+        self.active_memtable.put(key.to_vec(), Some(value))?;
+
+        // Check size and freeze if necessary
+        if self.active_memtable.size() >= MAX_MEMTABLE_SIZE {
+            self.freeze_active_memtable()?;
+        }
+        Ok(())
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.memtable.get(key).flatten())
+        if let Some(value) = self.active_memtable.get(key) {
+            return Ok(value);
+        }
+        for memtable in self.frozen_memtables.iter().rev() {
+            if let Some(value) = memtable.get(key) {
+                return Ok(value);
+            }
+        }
+        Ok(None)
     }
 
-    fn scan<'a>(&'a self, range: impl RangeBounds<Vec<u8>> + 'a) -> Self::ScanIterator<'a> {
-        let memtable_iter = self.memtable.scan(range).expect("Scan failed");
+    fn scan<'a>(&'a self, range: impl RangeBounds<Vec<u8>> + 'a + Clone) -> Self::ScanIterator<'a> {
+        let iterators: Vec<Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>> = self
+            .frozen_memtables
+            .iter()
+            .rev()
+            .chain(std::iter::once(&self.active_memtable))
+            .map(|memtable| Box::new(memtable.scan(range.clone()).unwrap()) as _)
+            .collect();
+
         ScanIterator {
-            inner: Box::new(memtable_iter),
+            inner: Box::new(iterators.into_iter().flatten()),
         }
     }
 }
@@ -143,5 +189,110 @@ mod tests {
         // Assert that lexicographically close but non-matching keys are excluded
         assert!(!results.contains(&(b"kez1".to_vec(), b"value_kez1".to_vec())));
         assert!(!results.contains(&(b"kea".to_vec(), b"value_kea".to_vec())));
+    }
+
+    #[test]
+    fn test_freeze_on_max_size() {
+        let mut store = create_temp_store();
+
+        // Insert enough data to reach the maximum size of the active Memtable
+        let large_value = vec![0u8; MAX_MEMTABLE_SIZE / 2];
+        store
+            .set(b"key1", large_value.clone())
+            .expect("Failed to set key1");
+        store.set(b"key2", large_value).expect("Failed to set key2");
+
+        // The active Memtable should have been frozen
+        assert_eq!(store.frozen_memtables.len(), 1, "Memtable was not frozen");
+        assert_eq!(
+            store.active_memtable.size(),
+            0,
+            "New Memtable was not created after freeze"
+        );
+    }
+
+    #[test]
+    fn test_access_frozen_memtables() {
+        let mut store = create_temp_store();
+
+        // Insert data into the active Memtable
+        store
+            .set(b"key1", b"value1".to_vec())
+            .expect("Failed to set key1");
+        store
+            .set(b"key2", b"value2".to_vec())
+            .expect("Failed to set key2");
+
+        // Freeze the active Memtable
+        store
+            .freeze_active_memtable()
+            .expect("Failed to freeze Memtable");
+
+        // Insert data into the new active Memtable
+        store
+            .set(b"key3", b"value3".to_vec())
+            .expect("Failed to set key3");
+
+        // Access keys in frozen Memtables
+        assert_eq!(
+            store.get(b"key1").expect("Failed to get key1"),
+            Some(b"value1".to_vec()),
+            "Failed to access key1 in frozen Memtable"
+        );
+        assert_eq!(
+            store.get(b"key2").expect("Failed to get key2"),
+            Some(b"value2".to_vec()),
+            "Failed to access key2 in frozen Memtable"
+        );
+
+        // Access keys in the active Memtable
+        assert_eq!(
+            store.get(b"key3").expect("Failed to get key3"),
+            Some(b"value3".to_vec()),
+            "Failed to access key3 in active Memtable"
+        );
+    }
+
+    #[test]
+    fn test_scan_across_frozen_and_active_memtables() {
+        let mut store = create_temp_store();
+
+        // Insert keys into the active Memtable
+        store
+            .set(b"key1", b"value1".to_vec())
+            .expect("Failed to set key1");
+        store
+            .set(b"key2", b"value2".to_vec())
+            .expect("Failed to set key2");
+
+        // Freeze the active Memtable
+        store
+            .freeze_active_memtable()
+            .expect("Failed to freeze Memtable");
+
+        // Insert keys into the new active Memtable
+        store
+            .set(b"key3", b"value3".to_vec())
+            .expect("Failed to set key3");
+        store
+            .set(b"key4", b"value4".to_vec())
+            .expect("Failed to set key4");
+
+        // Scan across both frozen and active Memtables
+        let scanned_keys: Vec<_> = store
+            .scan(b"key1".to_vec()..=b"key4".to_vec())
+            .collect::<Result<Vec<_>>>()
+            .expect("Failed to collect scan results");
+
+        assert_eq!(
+            scanned_keys,
+            vec![
+                (b"key1".to_vec(), b"value1".to_vec()),
+                (b"key2".to_vec(), b"value2".to_vec()),
+                (b"key3".to_vec(), b"value3".to_vec()),
+                (b"key4".to_vec(), b"value4".to_vec())
+            ],
+            "Scanned keys do not match expected results"
+        );
     }
 }

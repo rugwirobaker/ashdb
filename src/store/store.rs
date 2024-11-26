@@ -14,7 +14,7 @@ pub trait Store {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Iterates over an ordered range of key-value pairs.
-    fn scan<'a>(&'a self, range: impl RangeBounds<Vec<u8>> + 'a) -> Self::ScanIterator<'a>;
+    fn scan<'a>(&'a self, range: impl RangeBounds<Vec<u8>> + 'a + Clone) -> Self::ScanIterator<'a>;
 
     /// Iterates over all key-value pairs starting with the given prefix.
     fn scan_prefix<'a>(&'a self, prefix: &'a [u8]) -> Self::ScanIterator<'a> {
