@@ -3,7 +3,7 @@ use crate::{
     error::Result,
     memtable::{Memtable, MAX_MEMTABLE_SIZE},
 };
-use std::{ops::RangeBounds, sync::Arc};
+use std::{cmp::Ordering, collections::BinaryHeap, ops::RangeBounds, sync::Arc};
 
 pub struct LsmStore {
     dir: String,
@@ -40,7 +40,8 @@ impl LsmStore {
 }
 
 impl Store for LsmStore {
-    type ScanIterator<'a> = ScanIterator<'a>;
+    // Define the type of iterator returned by the scan method
+    type ScanIterator<'a> = MergeIterator<'a>;
 
     fn set(&mut self, key: &[u8], value: Vec<u8>) -> Result<()> {
         self.active_memtable.put(key.to_vec(), Some(value))?;
@@ -65,30 +66,124 @@ impl Store for LsmStore {
     }
 
     fn scan<'a>(&'a self, range: impl RangeBounds<Vec<u8>> + 'a + Clone) -> Self::ScanIterator<'a> {
-        let iterators: Vec<Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>> = self
-            .frozen_memtables
-            .iter()
-            .rev()
-            .chain(std::iter::once(&self.active_memtable))
-            .map(|memtable| Box::new(memtable.scan(range.clone()).unwrap()) as _)
-            .collect();
+        let iterators: Vec<Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>> =
+            std::iter::once(&self.active_memtable)
+                .chain(self.frozen_memtables.iter().rev())
+                .map(|memtable| Box::new(memtable.scan(range.clone()).unwrap()) as _)
+                .collect();
 
-        ScanIterator {
-            inner: Box::new(iterators.into_iter().flatten()),
+        MergeIterator::new(iterators)
+    }
+}
+
+// HeapEntry holds entries from iterators for merging
+struct HeapEntry<'a> {
+    key: Vec<u8>,   // The key from the iterator
+    value: Vec<u8>, // The value associated with the key
+    source: usize,  // Index indicating the source iterator (lower index means newer data)
+    iterator: Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>, // The iterator itself
+}
+
+impl<'a> std::fmt::Debug for HeapEntry<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeapEntry")
+            .field("key", &self.key)
+            .field("value", &self.value)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl<'a> PartialEq for HeapEntry<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl<'a> Eq for HeapEntry<'a> {}
+
+impl<'a> PartialOrd for HeapEntry<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.key.cmp(&other.key).reverse())
+    }
+}
+
+impl<'a> Ord for HeapEntry<'a> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.key.cmp(&other.key) {
+            // If keys are equal, prioritize entries from newer sources (lower source index)
+            Ordering::Equal => other.source.cmp(&self.source),
+            // For different keys, order them in ascending order (smaller keys are 'greater' in heap)
+            other => other.reverse(),
         }
     }
 }
 
-// ScanIterator is a wrapper around the Memtable's ScanIter.
-pub struct ScanIterator<'a> {
-    inner: Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>,
+#[derive(Debug)]
+pub struct MergeIterator<'a> {
+    heap: BinaryHeap<HeapEntry<'a>>, // Max-heap to keep track of the next smallest key
+    latest_key: Option<Vec<u8>>,     // The last key that was returned
 }
 
-impl<'a> Iterator for ScanIterator<'a> {
+impl<'a> MergeIterator<'a> {
+    pub fn new(iterators: Vec<Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>>) -> Self {
+        let mut heap = BinaryHeap::new();
+
+        // Initialize the heap with the first item from each iterator
+        for (source, mut iterator) in iterators.into_iter().enumerate() {
+            if let Some(Ok((key, value))) = iterator.next() {
+                // Push the initial entry onto the heap
+                heap.push(HeapEntry {
+                    key,
+                    value,
+                    source,
+                    iterator,
+                });
+            }
+        }
+
+        Self {
+            heap,
+            latest_key: None, // Initially no key has been processed
+        }
+    }
+}
+
+impl<'a> Iterator for MergeIterator<'a> {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        // Continue until there are no more entries in the heap
+        while let Some(mut entry) = self.heap.pop() {
+            // Check if the key is a duplicate of the last key returned
+            if self.latest_key.as_ref() == Some(&entry.key) {
+                // Fetch the next item from the same iterator and push it onto the heap
+                if let Some(Ok((key, value))) = entry.iterator.next() {
+                    self.heap.push(HeapEntry {
+                        key,
+                        value,
+                        source: entry.source,
+                        iterator: entry.iterator,
+                    });
+                }
+                continue; // Skip to the next entry
+            }
+
+            self.latest_key = Some(entry.key.clone());
+
+            // Fetch the next item from the same iterator and push it onto the heap
+            if let Some(Ok((key, value))) = entry.iterator.next() {
+                self.heap.push(HeapEntry {
+                    key,
+                    value,
+                    source: entry.source,
+                    iterator: entry.iterator,
+                });
+            }
+            return Some(Ok((entry.key, entry.value)));
+        }
+
+        None // No more elements to iterate
     }
 }
 
@@ -293,6 +388,49 @@ mod tests {
                 (b"key4".to_vec(), b"value4".to_vec())
             ],
             "Scanned keys do not match expected results"
+        );
+    }
+
+    #[test]
+    fn test_scan_duplicate_keys_multiple() {
+        let mut store = create_temp_store();
+
+        // Insert the first key ("key1") into the active memtable
+        store.set(b"key1", b"value1".to_vec()).expect("Set failed");
+
+        // Insert the second key ("key2") into the active memtable
+        store.set(b"key2", b"valueA".to_vec()).expect("Set failed");
+
+        // Freeze the active memtable to move "key1" and "key2" into a frozen memtable
+        store
+            .freeze_active_memtable()
+            .expect("Failed to freeze memtable");
+
+        // Insert the same key ("key1") with a new value into the new active memtable
+        store.set(b"key1", b"value2".to_vec()).expect("Set failed");
+
+        // Insert the same key ("key2") with a new value into the new active memtable
+        store.set(b"key2", b"valueB".to_vec()).expect("Set failed");
+
+        // Perform a scan that includes "key1" and "key2"
+        let results: Vec<_> = store
+            .scan(b"key1".to_vec()..=b"key2".to_vec())
+            .collect::<Result<Vec<_>>>()
+            .expect("Scan failed");
+
+        // Assert that the scan contains exactly two unique keys
+        assert_eq!(results.len(), 2, "Unexpected number of keys in scan");
+
+        // Verify the values for "key1" and "key2" are the most recent
+        assert_eq!(
+            results[0],
+            (b"key1".to_vec(), b"value2".to_vec()),
+            "Incorrect value for key1"
+        );
+        assert_eq!(
+            results[1],
+            (b"key2".to_vec(), b"valueB".to_vec()),
+            "Incorrect value for key2"
         );
     }
 }
