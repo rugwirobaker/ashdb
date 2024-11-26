@@ -314,4 +314,34 @@ mod tests {
 
         assert!(scan_iter.next().is_none(), "Expected no more results");
     }
+
+    #[test]
+    fn test_memtable_keys_are_sorted() {
+        let temp_dir = create_temp_dir();
+        let memtable = create_temp_memtable(&temp_dir);
+
+        // Insert keys in unsorted order
+        memtable
+            .put(b"key3".to_vec(), Some(b"value3".to_vec()))
+            .unwrap();
+        memtable
+            .put(b"key1".to_vec(), Some(b"value1".to_vec()))
+            .unwrap();
+        memtable
+            .put(b"key2".to_vec(), Some(b"value2".to_vec()))
+            .unwrap();
+
+        // Scan all keys
+        let scanned_keys: Vec<_> = memtable
+            .scan(b"key1".to_vec()..=b"key3".to_vec())
+            .unwrap()
+            .map(|res| res.unwrap().0) // Extract keys
+            .collect();
+
+        // Assert keys are in sorted order
+        assert_eq!(
+            scanned_keys,
+            vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()]
+        );
+    }
 }
