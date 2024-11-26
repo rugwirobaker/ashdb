@@ -155,6 +155,17 @@ impl Memtable {
             inner: skipmap_range,
         })
     }
+
+    // sync synchronizes the Memtable's WAL.
+    pub fn sync(&self) -> Result<()> {
+        let mut wal = self.wal.lock().map_err(|_| {
+            Error::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to lock WAL",
+            ))
+        })?;
+        wal.sync()
+    }
 }
 
 type SkipMapRange<'a> = crossbeam_skiplist::map::Range<
@@ -346,5 +357,44 @@ mod tests {
             scanned_keys,
             vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()]
         );
+    }
+
+    #[test]
+    fn test_sync() {
+        let temp_dir = create_temp_dir();
+        let mut wal = create_temp_wal(&temp_dir);
+
+        // Append some key-value pairs
+        wal.put(b"key1", Some(b"value1")).expect("Failed to append");
+        wal.put(b"key2", Some(b"value2")).expect("Failed to append");
+        wal.put(b"key3", None).expect("Failed to append (key only)");
+
+        // Create a Memtable from the WAL
+        let memtable = Memtable::from_wal(wal).expect("Failed to create Memtable from WAL");
+
+        // Sync the Memtable
+        memtable.sync().expect("Failed to sync");
+
+        // WAL should contain the same data as the Memtable
+        let wal = memtable.wal.lock().unwrap();
+        let wal = wal.replay().unwrap();
+        for (i, entry) in wal.enumerate() {
+            let (key, value) = entry.unwrap();
+            match i {
+                0 => {
+                    assert_eq!(key, b"key1");
+                    assert_eq!(value, Some(b"value1".to_vec()));
+                }
+                1 => {
+                    assert_eq!(key, b"key2");
+                    assert_eq!(value, Some(b"value2".to_vec()));
+                }
+                2 => {
+                    assert_eq!(key, b"key3");
+                    assert_eq!(value, None);
+                }
+                _ => panic!("Unexpected entry in WAL"),
+            }
+        }
     }
 }

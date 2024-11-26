@@ -67,6 +67,11 @@ impl Wal {
             .and_then(|num| num.parse::<u64>().ok())
             .ok_or_else(|| Error::InvalidWalId(format!("Invalid WAL file name: {:?}", self.path)))
     }
+
+    /// Returns the current size of the WAL file.
+    pub fn size(&self) -> u64 {
+        self.file.metadata().map_or(0, |meta| meta.len())
+    }
 }
 
 impl Wal {
