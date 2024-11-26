@@ -70,6 +70,18 @@ impl Memtable {
     }
 }
 
+impl Clone for Memtable {
+    fn clone(&self) -> Self {
+        Memtable {
+            id: self.id,                                                       // Copy the ID directly
+            data: Arc::clone(&self.data), // Clone the Arc for shared data
+            wal: Arc::clone(&self.wal),   // Clone the Arc for the WAL
+            size: AtomicUsize::new(self.size.load(Ordering::SeqCst)), // Initialize a new AtomicUsize with the current size
+            is_frozen: AtomicBool::new(self.is_frozen.load(Ordering::SeqCst)), // Initialize a new AtomicBool with the current frozen state
+        }
+    }
+}
+
 impl Memtable {
     /// Inserts or updates a key-value pair in the Memtable.
     pub fn put(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
