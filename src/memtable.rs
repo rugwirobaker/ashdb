@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::sstable::{block, table};
 use crate::{wal::wal::Wal, Error};
 use crossbeam_skiplist::{map::Entry, SkipMap};
 use std::{
@@ -168,6 +169,60 @@ impl Memtable {
     }
 }
 
+impl Memtable {
+    pub fn flush(&self, writer: &mut table::Writer) -> Result<()> {
+        let mut builder = block::Builder::new();
+        let mut first_key_in_block: Option<Vec<u8>> = None;
+
+        for entry in self.data.iter() {
+            let key = entry.key();
+            let value = entry.value().clone().unwrap_or_default();
+
+            // If this is the first entry in the block, record the key
+            if first_key_in_block.is_none() {
+                first_key_in_block = Some(key.clone());
+            }
+
+            builder.add_entry(key, &value);
+
+            // Check if the block size exceeds the limit (e.g., 4KB)
+            if builder.len() >= table::MAX_BLOCK_SIZE {
+                // Finish the block and write it to SSTable
+                let block_data = builder.finish();
+                match first_key_in_block.take() {
+                    Some(first_key) => {
+                        writer.add_block(&block_data, first_key)?;
+                    }
+                    None => {
+                        return Err(Error::InvalidState(
+                            "First key in block is missing".to_string(),
+                        ));
+                    }
+                }
+                builder = block::Builder::new(); // Start a new block
+                first_key_in_block = None; // Reset for the next block
+            }
+        }
+
+        // Write the last block if any entries are left
+        if builder.entry_count() > 0 {
+            let block_data = builder.finish();
+            match first_key_in_block.take() {
+                Some(first_key) => {
+                    writer.add_block(&block_data, first_key)?;
+                }
+                None => {
+                    return Err(Error::InvalidState(
+                        "First key in block is missing".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 type SkipMapRange<'a> = crossbeam_skiplist::map::Range<
     'a,
     Vec<u8>,
@@ -293,8 +348,6 @@ mod tests {
     #[test]
     fn test_scan() {
         let temp_dir = create_temp_dir();
-        println!("TempDir path: {}", temp_dir.path().display());
-
         let memtable = create_temp_memtable(&temp_dir);
 
         // Insert key-value pairs

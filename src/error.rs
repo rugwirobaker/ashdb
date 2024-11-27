@@ -15,6 +15,12 @@ pub enum Error {
     KeyNotFound,   // From LSM store
     Frozen,
     InvalidWalId(String),
+    InvalidState(String),
+
+    // New variants
+    ReadError(&'static str, io::Error),
+    WriteError(&'static str, io::Error),
+    IndexCorruption(String),
 }
 
 impl From<io::Error> for Error {
@@ -37,6 +43,10 @@ impl std::fmt::Display for Error {
             Error::Frozen => write!(f, "Memtable is frozen"),
             Error::KeyNotFound => write!(f, "Key not found"),
             Error::InvalidWalId(msg) => write!(f, "Invalid WAL ID: {}", msg),
+            Error::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
+            Error::ReadError(context, err) => write!(f, "Failed to read {}: {}", context, err),
+            Error::WriteError(context, err) => write!(f, "Failed to write {}: {}", context, err),
+            Error::IndexCorruption(msg) => write!(f, "Index corruption: {}", msg),
         }
     }
 }

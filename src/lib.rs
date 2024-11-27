@@ -1,7 +1,9 @@
+pub mod cache;
 pub mod error;
 pub mod hasher;
 pub mod memtable;
 pub mod multiwriter;
+pub mod sstable;
 pub mod store;
 pub mod wal;
 
