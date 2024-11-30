@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod error;
+pub mod flock;
 pub mod hasher;
 pub mod memtable;
 pub mod multiwriter;
