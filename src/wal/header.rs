@@ -15,10 +15,11 @@ pub struct Header {
 }
 
 impl Header {
+    #[allow(clippy::new_without_default)]
     pub fn new(version: u16) -> Self {
         Header {
             magic_number: 0x57_41_4C, // ASCII "WAL"
-            version: version,
+            version,
             entry_count: 0,
             checksum: 0,
         }
@@ -55,8 +56,7 @@ impl TryFrom<&[u8]> for Header {
         if bytes.len() < HEADER_SIZE {
             return Err(Error::InvalidHeader);
         }
-
-        let mut decoder = HeaderDecoder::new(&bytes[..]);
+        let mut decoder = HeaderDecoder::new(bytes);
         decoder.decode()
     }
 }

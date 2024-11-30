@@ -69,7 +69,7 @@ impl Memtable {
             wal: Arc::new(Mutex::new(wal)), // Ensure WAL is still usable elsewhere
             size,
             is_frozen: AtomicBool::new(false),
-            id: id,
+            id,
         })
     }
 }

@@ -145,7 +145,7 @@ impl ReplayIterator {
         reader
             .get_mut()
             .seek(SeekFrom::Start(HEADER_SIZE as u64))
-            .map_err(|e| Error::IoError(e))?;
+            .map_err(Error::IoError)?;
 
         Ok(ReplayIterator {
             reader,
@@ -229,21 +229,11 @@ impl Iterator for ReplayIterator {
     fn next(&mut self) -> Option<Self::Item> {
         match ReplayIterator::read(&mut self.reader) {
             Ok(Some((key, value))) => {
-                println!(
-                    "ReplayIterator read entry: key = {:?}, value = {:?}",
-                    key, value
-                );
                 self.hasher.update(&key, value.as_deref().unwrap_or(&[]));
                 Some(Ok((key, value)))
             }
-            Ok(None) => {
-                // println!("ReplayIterator reached EOF");
-                None
-            }
-            Err(e) => {
-                println!("ReplayIterator encountered error: {:?}", e);
-                Some(Err(e))
-            }
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
         }
     }
 }

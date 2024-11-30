@@ -56,13 +56,13 @@ impl Writer {
                 .write_u64::<BigEndian>(*block_offset)
                 .map_err(|e| Error::WriteError("block offset in index block", e))?;
         }
-        self.file.flush().map_err(|e| Error::IoError(e))?;
+        self.file.flush().map_err(Error::IoError)?;
 
         // Write footer (index offset)
         self.file
             .write_u64::<BigEndian>(index_offset)
             .map_err(|e| Error::WriteError("footer (index offset)", e))?;
-        self.file.flush().map_err(|e| Error::IoError(e))?;
+        self.file.flush().map_err(Error::IoError)?;
 
         Ok(())
     }

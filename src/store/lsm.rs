@@ -66,12 +66,12 @@ impl Store for LsmStore {
     }
 
     fn scan<'a>(&'a self, range: impl RangeBounds<Vec<u8>> + 'a + Clone) -> Self::ScanIterator<'a> {
-        let iterators: Vec<Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>> =
-            std::iter::once(&self.active_memtable)
-                .chain(self.frozen_memtables.iter().rev())
-                .map(|memtable| Box::new(memtable.scan(range.clone()).unwrap()) as _)
-                .collect();
+        type BoxedResultIterator<'a> = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>;
 
+        let iterators: Vec<BoxedResultIterator<'a>> = std::iter::once(&self.active_memtable)
+            .chain(self.frozen_memtables.iter().rev())
+            .map(|memtable| Box::new(memtable.scan(range.clone()).unwrap()) as _)
+            .collect();
         MergeIterator::new(iterators)
     }
 }
