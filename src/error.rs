@@ -16,11 +16,11 @@ pub enum Error {
     Frozen,
     InvalidWalId(String),
     InvalidState(String),
-
     // New variants
     ReadError(&'static str, io::Error),
     WriteError(&'static str, io::Error),
     IndexCorruption(String),
+    LockError(io::Error),
 }
 
 impl From<io::Error> for Error {
@@ -47,6 +47,7 @@ impl std::fmt::Display for Error {
             Error::ReadError(context, err) => write!(f, "Failed to read {}: {}", context, err),
             Error::WriteError(context, err) => write!(f, "Failed to write {}: {}", context, err),
             Error::IndexCorruption(msg) => write!(f, "Index corruption: {}", msg),
+            Error::LockError(err) => write!(f, "Lock error: {}", err),
         }
     }
 }
