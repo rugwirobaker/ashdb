@@ -13,6 +13,7 @@ pub struct Entry<'a> {
     pub offset: u64,   // The offset associated with this entry
 }
 
+#[derive(Debug, Clone)]
 pub struct Index {
     entries: Vec<(Vec<u8>, u64)>, // Key and block offset
 }
@@ -58,6 +59,14 @@ impl TryFrom<&[u8]> for Index {
             entries.push((key, block_offset));
         }
         Ok(Self { entries })
+    }
+}
+
+impl TryFrom<&Index> for Vec<u8> {
+    type Error = Error;
+
+    fn try_from(index: &Index) -> Result<Vec<u8>> {
+        index.try_into()
     }
 }
 

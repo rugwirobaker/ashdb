@@ -21,6 +21,7 @@ pub enum Error {
     WriteError(&'static str, io::Error),
     IndexCorruption(String),
     LockError(io::Error),
+    InvalidOperation(String),
 }
 
 impl From<io::Error> for Error {
@@ -48,6 +49,7 @@ impl std::fmt::Display for Error {
             Error::WriteError(context, err) => write!(f, "Failed to write {}: {}", context, err),
             Error::IndexCorruption(msg) => write!(f, "Index corruption: {}", msg),
             Error::LockError(err) => write!(f, "Lock error: {}", err),
+            Error::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
         }
     }
 }
