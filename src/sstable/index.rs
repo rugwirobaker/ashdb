@@ -122,7 +122,8 @@ impl Index {
         }
     }
 
-    pub fn offset(&self, index: usize) -> Option<u64> {
+    /// Gets the offset for a given entry index
+    pub fn get(&self, index: usize) -> Option<u64> {
         self.entries.get(index).map(|(_, offset)| *offset)
     }
 

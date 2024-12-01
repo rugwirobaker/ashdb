@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, sync::Arc};
 
 use crate::{error::Result, Error};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -89,6 +89,7 @@ impl Builder {
     }
 }
 
+#[derive(Clone)]
 pub struct Block {
     data: Vec<u8>,
     restart_positions: Vec<u32>,
@@ -141,7 +142,8 @@ impl Block {
 
     /// Iterates over the block entries, and returns the value for the given key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut iter = self.iter();
+        let block = Arc::new(self.clone());
+        let mut iter = block.iter();
         if let Some((found_key, found_value)) = iter.seek(key) {
             if found_key == key {
                 return Ok(Some(found_value));
@@ -149,39 +151,36 @@ impl Block {
         }
         Ok(None)
     }
-
-    pub fn iter(&self) -> BlockIterator {
-        BlockIterator::new(&self.data, &self.restart_positions)
+    pub fn iter(self: Arc<Self>) -> BlockIterator {
+        BlockIterator::new(self)
     }
 }
 
-pub struct BlockIterator<'a> {
-    data: &'a [u8],
-    restart_positions: &'a [u32],
-    current_restart: usize,
-    current_offset: usize,
-    last_key: Vec<u8>,
+pub struct BlockIterator {
+    block: Arc<Block>,      // Own the block through Arc
+    current_restart: usize, // Index of the current restart point
+    current_offset: usize,  // Offset of the current entry within the block
+    last_key: Vec<u8>,      // Last fully reconstructed key
 }
 
-impl<'a> BlockIterator<'a> {
-    fn new(data: &'a [u8], restart_positions: &'a [u32]) -> Self {
+impl BlockIterator {
+    pub fn new(block: Arc<Block>) -> Self {
         Self {
-            data,
-            restart_positions,
             current_restart: 0,
-            current_offset: restart_positions[0] as usize,
+            current_offset: block.restart_positions[0] as usize,
             last_key: Vec::new(),
+            block, // Store the block directly
         }
     }
 
     pub fn seek(&mut self, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         // Binary search over restart points
         let mut left = 0;
-        let mut right = self.restart_positions.len() - 1;
+        let mut right = self.block.restart_positions.len() - 1;
 
         while left <= right {
             let mid = (left + right) / 2;
-            let offset = self.restart_positions[mid] as usize;
+            let offset = self.block.restart_positions[mid] as usize;
             let (key, _) = self.read_entry_at(offset)?;
             let cmp = key.as_slice().cmp(target);
 
@@ -207,10 +206,10 @@ impl<'a> BlockIterator<'a> {
         } else {
             self.current_restart = 0;
         }
-        self.current_offset = self.restart_positions[self.current_restart] as usize;
+        self.current_offset = self.block.restart_positions[self.current_restart] as usize;
         self.last_key.clear();
 
-        while self.current_offset < self.data.len() {
+        while self.current_offset < self.block.data.len() {
             // let entry_offset = self.current_offset;
             let (key, value) = self.read_entry()?;
             let cmp = key.as_slice().cmp(target);
@@ -227,6 +226,11 @@ impl<'a> BlockIterator<'a> {
         None
     }
 
+    /// peel returns the current entry without advancing the iterator
+    pub fn peek(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.read_entry_at(self.current_offset)
+    }
+
     fn read_entry(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         let result = self.read_entry_at(self.current_offset);
         if let Some((key, _value)) = &result {
@@ -238,34 +242,34 @@ impl<'a> BlockIterator<'a> {
     fn read_entry_at(&mut self, offset: usize) -> Option<(Vec<u8>, Vec<u8>)> {
         let mut pos = offset;
 
-        if pos + 8 > self.data.len() {
+        if pos + 8 > self.block.data.len() {
             return None;
         }
 
         // Read shared key length
-        let shared_len = (&self.data[pos..]).read_u16::<BigEndian>().ok()? as usize;
+        let shared_len = (&self.block.data[pos..]).read_u16::<BigEndian>().ok()? as usize;
         pos += 2;
 
         // Read unshared key length
-        let unshared_len = (&self.data[pos..]).read_u16::<BigEndian>().ok()? as usize;
+        let unshared_len = (&self.block.data[pos..]).read_u16::<BigEndian>().ok()? as usize;
         pos += 2;
 
         // Read value length
-        let value_len = (&self.data[pos..]).read_u32::<BigEndian>().ok()? as usize;
+        let value_len = (&self.block.data[pos..]).read_u32::<BigEndian>().ok()? as usize;
         pos += 4;
 
-        if pos + unshared_len + value_len > self.data.len() {
+        if pos + unshared_len + value_len > self.block.data.len() {
             return None;
         }
 
         // Reconstruct key
         let mut key = Vec::with_capacity(shared_len + unshared_len);
         key.extend_from_slice(&self.last_key[..shared_len]);
-        key.extend_from_slice(&self.data[pos..pos + unshared_len]);
+        key.extend_from_slice(&self.block.data[pos..pos + unshared_len]);
         pos += unshared_len;
 
         // Read value
-        let value = self.data[pos..pos + value_len].to_vec();
+        let value = self.block.data[pos..pos + value_len].to_vec();
         pos += value_len;
 
         self.current_offset = pos;
@@ -277,31 +281,31 @@ impl<'a> BlockIterator<'a> {
     fn read_value_at(&self, offset: usize) -> Option<Vec<u8>> {
         let mut pos = offset;
 
-        if pos + 8 > self.data.len() {
+        if pos + 8 > self.block.data.len() {
             return None;
         }
 
         // Read shared key length
-        let _shared_len = (&self.data[pos..]).read_u16::<BigEndian>().ok()? as usize;
+        let _shared_len = (&self.block.data[pos..]).read_u16::<BigEndian>().ok()? as usize;
         pos += 2;
 
         // Read unshared key length
-        let unshared_len = (&self.data[pos..]).read_u16::<BigEndian>().ok()? as usize;
+        let unshared_len = (&self.block.data[pos..]).read_u16::<BigEndian>().ok()? as usize;
         pos += 2;
 
         // Read value length
-        let value_len = (&self.data[pos..]).read_u32::<BigEndian>().ok()? as usize;
+        let value_len = (&self.block.data[pos..]).read_u32::<BigEndian>().ok()? as usize;
         pos += 4;
 
         // Skip key suffix
         pos += unshared_len;
 
-        if pos + value_len > self.data.len() {
+        if pos + value_len > self.block.data.len() {
             return None;
         }
 
         // Read value
-        Some(self.data[pos..pos + value_len].to_vec())
+        Some(self.block.data[pos..pos + value_len].to_vec())
     }
 }
 
@@ -332,7 +336,7 @@ mod tests {
         let block_data = builder.finish();
 
         // Create a Block from the block data
-        let block = Block::new(block_data).expect("Failed to create block");
+        let block = Arc::new(Block::new(block_data).expect("Failed to create block"));
 
         // Create a BlockIterator
         let mut iter = block.iter();

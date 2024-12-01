@@ -1,4 +1,4 @@
-use super::block::Block;
+use super::block::{Block, BlockIterator};
 use super::index::Index;
 use crate::cache::Cache;
 use crate::error::Result;
@@ -100,7 +100,7 @@ impl Reader {
         if let Some(entry) = self.index.find(key) {
             // Determine the size of the block
             let block_size = if entry.index + 1 < self.index.len() {
-                self.index.offset(entry.index + 1).unwrap() - entry.offset
+                self.index.get(entry.index + 1).unwrap() - entry.offset
             } else {
                 self.index_offset - entry.offset // Use index offset for last block
             };
@@ -113,8 +113,11 @@ impl Reader {
         Ok(None)
     }
 
+    pub fn scan(&mut self) -> ScanIterator<'_> {
+        ScanIterator::new(self)
+    }
+
     fn read_block(&mut self, offset: u64, size: u64) -> Result<Arc<Block>> {
-        // Check cache first
         if let Some(block_arc) = self.block_cache.lock().unwrap().get(&offset) {
             return Ok(block_arc.clone());
         }
@@ -139,12 +142,81 @@ impl Reader {
     }
 }
 
+pub struct ScanIterator<'a> {
+    reader: &'a mut Reader,
+    current_block: Option<Arc<Block>>,
+    current_block_iter: Option<BlockIterator>,
+    current_block_index: usize,
+}
+
+impl<'a> ScanIterator<'a> {
+    fn new(reader: &'a mut Reader) -> Self {
+        Self {
+            reader,
+            current_block: None,
+            current_block_iter: None,
+            current_block_index: 0,
+        }
+    }
+
+    /// Load the next block and initialize its iterator
+    fn next_block(&mut self) -> Result<()> {
+        if self.current_block_index >= self.reader.index.len() {
+            self.current_block_iter = None; // No more blocks to load
+            return Ok(());
+        }
+
+        // Get the current block's offset and size
+        let block_offset = self.reader.index.get(self.current_block_index).unwrap();
+        let block_size = if self.current_block_index + 1 < self.reader.index.len() {
+            self.reader.index.get(self.current_block_index + 1).unwrap() - block_offset
+        } else {
+            self.reader.index_offset - block_offset // Last block
+        };
+
+        // Read the block
+        let block = self.reader.read_block(block_offset, block_size)?;
+
+        // Store the block and initialize its iterator
+        self.current_block = Some(block.clone()); // Keep the block alive
+        self.current_block_iter = Some(block.iter());
+        self.current_block_index += 1;
+
+        Ok(())
+    }
+}
+
+impl<'a> Iterator for ScanIterator<'a> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // If there's a current block iterator, try to get the next entry
+            if let Some(iter) = &mut self.current_block_iter {
+                if let Some(entry) = iter.peek() {
+                    return Some(Ok(entry));
+                }
+            }
+
+            // Load the next block if possible
+            if let Err(e) = self.next_block() {
+                return Some(Err(e));
+            }
+
+            // If no more blocks are available, terminate
+            if self.current_block_iter.is_none() {
+                return None;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::sstable::block;
+    use crate::sstable::block::{self, Builder};
     use std::fs;
 
     fn create_temp_dir() -> TempDir {
@@ -341,6 +413,163 @@ mod tests {
 
         // Optionally, remove the test file after the test
         let _ = fs::remove_file(sstable_path);
+    }
+
+    #[test]
+    fn test_sstable_scan() {
+        use tempfile::NamedTempFile;
+
+        // Create a temporary file for the SSTable
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path();
+
+        // Write sample SSTable data
+        let mut writer = Writer::new(path.to_str().unwrap()).expect("Failed to create writer");
+
+        // Create a large number of entries to ensure multiple blocks are created
+        let entries = vec![
+            (b"apple".to_vec(), b"fruit".to_vec()),
+            (b"application".to_vec(), b"software".to_vec()),
+            (b"banana".to_vec(), b"fruit".to_vec()),
+            (b"band".to_vec(), b"music".to_vec()),
+            (b"bandana".to_vec(), b"clothing".to_vec()),
+            (b"cherry".to_vec(), b"fruit".to_vec()),
+            (b"date".to_vec(), b"fruit".to_vec()),
+            (b"durian".to_vec(), b"fruit".to_vec()),
+        ];
+
+        let mut builder = Builder::new();
+        let mut first_key_in_block = None;
+
+        for (key, value) in entries.iter() {
+            // Track the first key in the block
+            if first_key_in_block.is_none() {
+                first_key_in_block = Some(key.clone());
+            }
+
+            // Add the key-value pair to the block
+            builder.add_entry(key, value);
+
+            // Simulate production-like behavior: flush the block if it grows too large
+            if builder.len() >= 4 * 1024 {
+                let block_data = builder.finish();
+                let first_key = first_key_in_block
+                    .take()
+                    .expect("Missing first key in block");
+
+                writer
+                    .add_block(&block_data, first_key)
+                    .expect("Failed to add block");
+
+                // Reset the builder for the next block
+                builder = Builder::new();
+            }
+        }
+
+        // Write the final block if there are remaining entries
+        if builder.len() > 0 {
+            let block_data = builder.finish();
+            let first_key = first_key_in_block
+                .take()
+                .expect("Missing first key in block");
+
+            writer
+                .add_block(&block_data, first_key)
+                .expect("Failed to add block");
+        }
+
+        writer.finish().expect("Failed to finish SSTable");
+
+        // Read and scan the SSTable
+        let mut reader = Reader::open(path.to_str().unwrap()).expect("Failed to open reader");
+        let mut scan_iter = reader.scan();
+
+        for (key, value) in entries {
+            let result = scan_iter
+                .next()
+                .expect("Missing entry")
+                .expect("Failed entry");
+            assert_eq!((key, value), result);
+        }
+
+        // Ensure no more entries exist
+        assert!(scan_iter.next().is_none());
+    }
+
+    #[test]
+    fn test_sstable_scan_with_large_blocks() {
+        use tempfile::NamedTempFile;
+
+        // Create a temporary file for the SSTable
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path();
+
+        // Write sample SSTable data
+        let mut writer = Writer::new(path.to_str().unwrap()).expect("Failed to create writer");
+
+        // Generate large entries to simulate real-world behavior
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..100)
+            .map(|i| {
+                let key = format!("key_{:05}", i).repeat(50).into_bytes(); // Large key
+                let value = format!("value_{:05}", i).repeat(100).into_bytes(); // Large value
+                (key, value)
+            })
+            .collect();
+
+        let mut builder = Builder::new();
+        let mut first_key_in_block = None;
+
+        for (key, value) in entries.iter() {
+            if first_key_in_block.is_none() {
+                first_key_in_block = Some(key.clone());
+            }
+
+            builder.add_entry(key, value);
+
+            // Flush block when it reaches or exceeds 4KB
+            if builder.len() >= 4 * 1024 {
+                let block_data = builder.finish();
+                let first_key = first_key_in_block
+                    .take()
+                    .expect("Missing first key in block");
+
+                writer
+                    .add_block(&block_data, first_key)
+                    .expect("Failed to add block");
+
+                // Reset the builder for the next block
+                builder = Builder::new();
+            }
+        }
+
+        // Write the final block if there are remaining entries
+        if builder.len() > 0 {
+            let block_data = builder.finish();
+            let first_key = first_key_in_block
+                .take()
+                .expect("Missing first key in block");
+
+            writer
+                .add_block(&block_data, first_key)
+                .expect("Failed to add block");
+        }
+
+        writer.finish().expect("Failed to finish SSTable");
+
+        // Read and scan the SSTable
+        let mut reader = Reader::open(path.to_str().unwrap()).expect("Failed to open reader");
+        let mut scan_iter = reader.scan();
+
+        for (key, value) in entries {
+            let result = scan_iter
+                .next()
+                .expect("Missing entry")
+                .expect("Failed entry");
+            assert_eq!((key, value), result);
+        }
+
+        // Ensure no more entries exist
+        assert!(scan_iter.next().is_none());
     }
 
     fn get_expected_sstable_bytes() -> Vec<u8> {
