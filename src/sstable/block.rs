@@ -13,6 +13,7 @@ pub struct Builder {
 }
 
 impl Builder {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             buffer: Vec::new(),
@@ -55,37 +56,22 @@ impl Builder {
     }
 
     pub fn finish(mut self) -> Vec<u8> {
-        // // Debug print before writing restart positions
-        // println!(
-        //     "BlockBuilder::finish: buffer length before = {}",
-        //     self.buffer.len()
-        // );
-
         // Write restart positions
         for pos in &self.restart_positions {
-            // println!("Writing restart position: {}", pos);
             self.buffer.write_u32::<BigEndian>(*pos).unwrap();
         }
-
-        // // Write number of restarts
-        // println!(
-        //     "Writing number of restarts: {}",
-        //     self.restart_positions.len()
-        // );
         self.buffer
             .write_u32::<BigEndian>(self.restart_positions.len() as u32)
             .unwrap();
-
-        // // Debug print after writing restart positions and number of restarts
-        // println!(
-        //     "BlockBuilder::finish: buffer length after = {}",
-        //     self.buffer.len()
-        // );
         self.buffer
     }
 
     pub fn len(&self) -> usize {
         self.buffer.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
     }
 
     pub fn entry_count(&self) -> usize {
@@ -151,6 +137,17 @@ impl Block {
             data: data[..restart_array_offset].to_vec(),
             restart_positions,
         })
+    }
+
+    /// Iterates over the block entries, and returns the value for the given key.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut iter = self.iter();
+        if let Some((found_key, found_value)) = iter.seek(key) {
+            if found_key == key {
+                return Ok(Some(found_value));
+            }
+        }
+        Ok(None)
     }
 
     pub fn iter(&self) -> BlockIterator {

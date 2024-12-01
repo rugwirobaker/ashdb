@@ -139,9 +139,8 @@ impl Reader {
         let mut left = 0;
         let mut right = self.index.len();
 
-        while left < right {
-            let mid = (left + right) / 2;
-            let cmp = self.index[mid].0.as_slice().cmp(key);
+            // Read the block
+            let block = self.read_block(entry.offset, block_size)?;
 
             if cmp == std::cmp::Ordering::Less {
                 left = mid + 1;
@@ -169,10 +168,10 @@ impl Reader {
         }
     }
 
-    fn read_from_block(&mut self, offset: u64, size: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn read_block(&mut self, offset: u64, size: u64) -> Result<Arc<Block>> {
         // Check cache first
         if let Some(block_arc) = self.block_cache.lock().unwrap().get(&offset) {
-            return self.search_block(block_arc.clone(), key);
+            return Ok(block_arc.clone());
         }
         // Read block data
         self.file
@@ -191,26 +190,7 @@ impl Reader {
             .lock()
             .unwrap()
             .insert(offset, block.clone());
-        // Search the block for the key
-        self.search_block(block, key)
-    }
-
-    fn get_block_size(&self, block_index: usize) -> u64 {
-        if block_index + 1 < self.index.len() {
-            self.index[block_index + 1].1 - self.index[block_index].1
-        } else {
-            self.index_offset - self.index[block_index].1
-        }
-    }
-
-    fn search_block(&self, block: Arc<Block>, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut iter = block.iter();
-        if let Some((found_key, value)) = iter.seek(key) {
-            if found_key == key {
-                return Ok(Some(value));
-            }
-        }
-        Ok(None)
+        Ok(block)
     }
 }
 
