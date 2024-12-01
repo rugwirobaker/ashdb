@@ -1,24 +1,59 @@
-use super::store::Store;
+use super::Store;
 use crate::{
     error::Result,
+    flock::FileLock,
     memtable::{Memtable, MAX_MEMTABLE_SIZE},
+    Error,
 };
-use std::{cmp::Ordering, collections::BinaryHeap, ops::RangeBounds, sync::Arc};
+use std::{cmp::Ordering, collections::BinaryHeap, ops::RangeBounds, path::Path, sync::Arc};
+
+const LOCK_FILE: &str = "ashdb.lock";
 
 pub struct LsmStore {
     dir: String,
+    lock: Option<FileLock>,         // Lock file to prevent concurrent access
     active_memtable: Arc<Memtable>, // Current active Memtable with read/write access
     frozen_memtables: Vec<Arc<Memtable>>, // Frozen Memtables
 }
 
 impl LsmStore {
-    pub fn new(dir: &str) -> Result<Self> {
+    pub fn open(dir: &str) -> Result<Self> {
+        Self::init_db_dir(dir)?;
+
+        let lock_file = FileLock::lock(Path::new(dir).join(LOCK_FILE)).map_err(Error::LockError)?;
+
         let active_memtable = Memtable::new(dir, 0)?;
         Ok(Self {
             dir: dir.to_string(),
+            lock: Some(lock_file),
             active_memtable: Arc::new(active_memtable),
             frozen_memtables: Vec::new(),
         })
+    }
+
+    // initialize the main database directory
+    fn init_db_dir(dir: &str) -> Result<()> {
+        let paths = [
+            Path::new(dir),
+            &Path::new(dir).join("sstables"),
+            &Path::new(dir).join("wal"),
+            &Path::new(dir).join("metadata"),
+        ];
+
+        for path in &paths {
+            if !path.exists() {
+                std::fs::create_dir_all(path).map_err(Error::IoError)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LsmStore {
+    fn drop(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            let _ = lock.unlock();
+        }
     }
 }
 
@@ -194,7 +229,8 @@ mod tests {
 
     fn create_temp_store() -> LsmStore {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        LsmStore::new(temp_dir.path().to_str().unwrap()).expect("Failed to initialize LsmStore")
+        println!("Temp dir: {:?}", temp_dir.path());
+        LsmStore::open(temp_dir.path().to_str().unwrap()).expect("Failed to initialize LsmStore")
     }
 
     #[test]
