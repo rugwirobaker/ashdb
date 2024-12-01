@@ -1,8 +1,11 @@
 use super::block::Block;
+use super::index::Index;
 use crate::cache::Cache;
 use crate::error::Result;
 use crate::Error;
+
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::{fs::File, io::Read};
@@ -11,8 +14,8 @@ pub const MAX_BLOCK_SIZE: usize = 4096;
 
 pub struct Writer {
     file: File,
-    index: Vec<(Vec<u8>, u64)>, // Pairs of first key and block offset
-    offset: u64,                // Current file offset
+    index: Index, // Sparse index
+    offset: u64,  // Current file offset
 }
 
 impl Writer {
@@ -20,7 +23,7 @@ impl Writer {
         let file = File::create(path)?;
         Ok(Self {
             file,
-            index: Vec::new(),
+            index: Index::new(),
             offset: 0,
         })
     }
@@ -31,7 +34,7 @@ impl Writer {
         self.file.flush()?;
 
         // Record the offset and first key
-        self.index.push((first_key, self.offset));
+        self.index.push(first_key, self.offset);
 
         // Update offset
         self.offset += block_data.len() as u64;
@@ -40,25 +43,11 @@ impl Writer {
     }
 
     pub fn finish(mut self) -> Result<()> {
-        // Write index block
-        let index_offset = self.offset;
-        for (key, block_offset) in &self.index {
-            // Write key length (u16) in big-endian
-            self.file
-                .write_u16::<BigEndian>(key.len() as u16)
-                .map_err(|e| Error::WriteError("key length in index block", e))?;
-            // Write key bytes
-            self.file
-                .write_all(key)
-                .map_err(|e| Error::WriteError("key in index block", e))?;
-            // Write block offset (u64) in big-endian
-            self.file
-                .write_u64::<BigEndian>(*block_offset)
-                .map_err(|e| Error::WriteError("block offset in index block", e))?;
-        }
-        self.file.flush().map_err(Error::IoError)?;
+        let index_data: Vec<u8> = self.index.try_into()?;
 
-        // Write footer (index offset)
+        let index_offset = self.offset;
+        self.file.write_all(&index_data)?;
+
         self.file
             .write_u64::<BigEndian>(index_offset)
             .map_err(|e| Error::WriteError("footer (index offset)", e))?;
@@ -70,7 +59,7 @@ impl Writer {
 
 pub struct Reader {
     file: File,
-    index: Vec<(Vec<u8>, u64)>, // Pairs of first key and block offset
+    index: Index,
     index_offset: u64,
     block_cache: Arc<Mutex<Cache<u64, Arc<Block>>>>,
 }
@@ -78,53 +67,25 @@ pub struct Reader {
 impl Reader {
     pub fn open(path: &str) -> Result<Self> {
         let mut file = File::open(path).map_err(Error::IoError)?;
+        let file_size = file.metadata()?.len();
 
-        // Get file size
-        let file_size = file.metadata().map_err(Error::IoError)?.len();
+        // Read footer to get the index offset
+        file.seek(SeekFrom::End(-8)).map_err(Error::IoError)?;
 
-        // Read footer (index offset)
-        file.seek(SeekFrom::End(-8))
-            .map_err(|e| Error::ReadError("footer (index offset)", e))?;
-        let index_offset = file
-            .read_u64::<BigEndian>()
-            .map_err(|e| Error::ReadError("index offset", e))?;
-
-        // Calculate index block size
-        let index_block_size = file_size - 8 - index_offset;
+        let index_offset = file.read_u64::<BigEndian>().map_err(Error::IoError)?;
 
         // Read index block into a buffer
-        file.seek(SeekFrom::Start(index_offset))
-            .map_err(|e| Error::ReadError("index block start", e))?;
+        let index_block_size = file_size - 8 - index_offset;
         let mut index_block = vec![0u8; index_block_size as usize];
+        file.seek(SeekFrom::Start(index_offset))
+            .map_err(|e| Error::ReadError("seek to index block", e))?;
         file.read_exact(&mut index_block)
-            .map_err(|e| Error::ReadError("index block", e))?;
+            .map_err(|e| Error::ReadError("read index block", e))?;
 
-        // Parse index entries from buffer
-        let mut index = Vec::new();
-        let mut cursor = std::io::Cursor::new(&index_block);
+        // Use TryFrom to parse the SparseIndex
+        let index = Index::try_from(index_block.as_slice())?;
 
-        while (cursor.position() as usize) < index_block.len() {
-            // Read key length (u16)
-            let key_len = cursor
-                .read_u16::<BigEndian>()
-                .map_err(|e| Error::ReadError("key length in index block", e))?
-                as usize;
-
-            // Read key bytes
-            let mut key = vec![0u8; key_len];
-            cursor
-                .read_exact(&mut key)
-                .map_err(|e| Error::ReadError("key in index block", e))?;
-
-            // Read block offset (u64)
-            let block_offset = cursor
-                .read_u64::<BigEndian>()
-                .map_err(|e| Error::ReadError("block offset in index block", e))?;
-
-            index.push((key, block_offset));
-        }
-
-        let block_cache = Arc::new(Mutex::new(Cache::new(1000, None))); // Adjust capacity as needed
+        let block_cache = Arc::new(Mutex::new(Cache::new(1000, None)));
 
         Ok(Self {
             file,
@@ -135,37 +96,21 @@ impl Reader {
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // Binary search over the index
-        let mut left = 0;
-        let mut right = self.index.len();
+        // Use the SparseIndex to find the closest entry
+        if let Some(entry) = self.index.find(key) {
+            // Determine the size of the block
+            let block_size = if entry.index + 1 < self.index.len() {
+                self.index.offset(entry.index + 1).unwrap() - entry.offset
+            } else {
+                self.index_offset - entry.offset // Use index offset for last block
+            };
 
             // Read the block
             let block = self.read_block(entry.offset, block_size)?;
 
-            if cmp == std::cmp::Ordering::Less {
-                left = mid + 1;
-            } else if cmp == std::cmp::Ordering::Greater {
-                if mid == 0 {
-                    break;
-                }
-                right = mid;
-            } else {
-                // Exact match
-                let block_offset = self.index[mid].1;
-                let block_size = self.get_block_size(mid);
-                return self.read_from_block(block_offset, block_size, key);
-            }
+            return block.get(key);
         }
-
-        // Key might be in the block at index left - 1
-        if left > 0 {
-            let block_index = left - 1;
-            let block_offset = self.index[block_index].1;
-            let block_size = self.get_block_size(block_index);
-            return self.read_from_block(block_offset, block_size, key);
-        } else {
-            Ok(None)
-        }
+        Ok(None)
     }
 
     fn read_block(&mut self, offset: u64, size: u64) -> Result<Arc<Block>> {
@@ -196,9 +141,15 @@ impl Reader {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
     use crate::sstable::block;
     use std::fs;
+
+    fn create_temp_dir() -> TempDir {
+        TempDir::new().expect("Failed to create temporary directory")
+    }
 
     #[test]
     fn test_sstable_writer_and_reader() {
@@ -211,10 +162,11 @@ mod tests {
             (b"bandana".to_vec(), b"clothing".to_vec()),
         ];
 
-        // Create an SSTableWriter
-        let sstable_path = "test_sstable.dat";
+        let temp_dir = create_temp_dir();
+        let sstable_path = temp_dir.path().join("test_sstable.dat");
+
         let mut sstable_writer =
-            Writer::new(sstable_path).expect("Failed to create sstable writer");
+            Writer::new(sstable_path.to_str().unwrap()).expect("Failed to create SSTable writer");
 
         // Use a BlockBuilder to create blocks
         let mut block_builder = block::Builder::new();
@@ -259,7 +211,8 @@ mod tests {
             .expect("Failed to finish writing SSTable");
 
         // Read from the SSTable
-        let mut sstable_reader = Reader::open(sstable_path).expect("Failed to open SSTable");
+        let mut sstable_reader =
+            Reader::open(sstable_path.to_str().unwrap()).expect("failed to open SSTable reader");
 
         // Test reading keys
         for (key, value) in entries {
