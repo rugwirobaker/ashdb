@@ -30,15 +30,15 @@ layered design:
 
 ### 2. SQL Query Engine (Planned)
 
-An extensible SQL engine will allow structured querying of data. This will
-include support for relational operations and custom extensions for time-series
-queries.
+An extensible SQL engine will allow structured querying of data. Just enough to
+look like TimeScaleDB and SQLite had a baby.
 
 ### 3. MVCC Transactions (Planned)
 
-To provide robust data consistency, Multi-Version Concurrency Control (MVCC)
-will enable safe concurrent reads and writes, supporting complex transactional
-workflows.
+Database transactions have beat my ass enough times that I decided it was time
+to stop reading books and put all tha knowledge to good use.
+[MVCC(Multi-Version Concurrency Control)](https://en.wikipedia.org/wiki/Multiversion_concurrency_control)
+is one way to skin them that I think will play well with a Key/Value store.
 
 ## Roadmap
 
