@@ -170,7 +170,7 @@ impl Memtable {
 }
 
 impl Memtable {
-    pub fn flush(&self, writer: &mut table::Table) -> Result<()> {
+    pub fn flush(&self, table: &mut table::Table) -> Result<()> {
         let mut builder = block::Builder::new();
         let mut first_key_in_block: Option<Vec<u8>> = None;
 
@@ -191,7 +191,7 @@ impl Memtable {
                 let block_data = builder.finish();
                 match first_key_in_block.take() {
                     Some(first_key) => {
-                        writer.add_block(&block_data, first_key)?;
+                        table.add_block(&block_data, first_key)?;
                     }
                     None => {
                         return Err(Error::InvalidState(
@@ -209,7 +209,7 @@ impl Memtable {
             let block_data = builder.finish();
             match first_key_in_block.take() {
                 Some(first_key) => {
-                    writer.add_block(&block_data, first_key)?;
+                    table.add_block(&block_data, first_key)?;
                 }
                 None => {
                     return Err(Error::InvalidState(
