@@ -207,10 +207,7 @@ impl Iterator for ScanIterator {
             if let Err(e) = self.next_block() {
                 return Some(Err(e));
             }
-
-            if self.current_block_iter.is_none() {
-                return None; // No more entries
-            }
+            self.current_block_iter.as_ref()?;
         }
     }
 }

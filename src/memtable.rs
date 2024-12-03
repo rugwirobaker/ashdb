@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::sstable::{block, table};
-use crate::{wal::wal::Wal, Error};
+use crate::{wal::Wal, Error};
 use crossbeam_skiplist::{map::Entry, SkipMap};
 use std::{
     ops::{Bound, RangeBounds},
