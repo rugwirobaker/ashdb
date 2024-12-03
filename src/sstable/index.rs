@@ -36,31 +36,35 @@ impl Index {
 
     /// Finds the closest entry that matches or precedes the given key
     pub fn find(&self, key: &[u8]) -> Option<Entry> {
-        let mut left = 0;
-        let mut right = self.entries.len();
+        let mut low = 0;
+        let mut high = self.entries.len();
 
-        while left < right {
-            let mid = (left + right) / 2;
-            let cmp = self.entries[mid].0.as_slice().cmp(key);
+        // Perform binary search
+        while low < high {
+            let mid = (low + high) / 2;
 
-            if cmp == std::cmp::Ordering::Less {
-                left = mid + 1;
-            } else if cmp == std::cmp::Ordering::Greater {
-                if mid == 0 {
-                    break;
+            match self.entries[mid].0.as_slice().cmp(key) {
+                std::cmp::Ordering::Less => low = mid + 1, // Narrow search to right half
+                std::cmp::Ordering::Greater => {
+                    if mid == 0 {
+                        break; // Exit if the key is smaller than all entries
+                    }
+                    high = mid; // Narrow search to left half
                 }
-                right = mid;
-            } else {
-                return Some(Entry {
-                    index: mid,
-                    key: &self.entries[mid].0,
-                    offset: self.entries[mid].1,
-                    size: self.entries[mid].2, // Include block size
-                });
+                std::cmp::Ordering::Equal => {
+                    // Return the exact match if found
+                    return Some(Entry {
+                        index: mid,
+                        key: &self.entries[mid].0,
+                        offset: self.entries[mid].1,
+                        size: self.entries[mid].2,
+                    });
+                }
             }
         }
-        if left > 0 {
-            let idx = left - 1;
+        // If no exact match, return the closest preceding entry
+        if low > 0 {
+            let idx = low - 1;
             Some(Entry {
                 index: idx,
                 key: &self.entries[idx].0,
