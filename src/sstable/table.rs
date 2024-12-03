@@ -9,6 +9,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 pub const MAX_BLOCK_SIZE: usize = 4096;
@@ -61,9 +62,9 @@ impl Table {
         }
     }
 
-    pub fn scan(&mut self) -> Result<ScanIterator> {
+    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIterator> {
         match self {
-            Table::Readable(readable) => readable.scan(),
+            Table::Readable(readable) => readable.scan(range),
             Table::Writable(_) => Err(Error::InvalidOperation(
                 "Cannot scan a writable table".to_string(),
             )),
@@ -83,26 +84,20 @@ impl WritableTable {
     }
 
     pub fn add_block(&mut self, block_data: &[u8], first_key: Vec<u8>) -> Result<()> {
+        let block_size = block_data.len() as u64;
         self.file.write_all(block_data)?;
-        self.index.push(first_key, self.offset);
+        self.index.push(first_key, self.offset, block_size);
         self.offset += block_data.len() as u64;
         Ok(())
     }
 
-    pub fn finish(&mut self) -> Result<()> {
+    pub fn finalize(&mut self) -> Result<Table> {
         let index_data: Vec<u8> = self.index.clone().try_into()?;
         let index_offset = self.offset;
 
         self.file.write_all(&index_data)?;
         self.file.write_u64::<BigEndian>(index_offset)?;
         self.file.flush()?;
-
-        Ok(())
-    }
-
-    pub fn finalize(&mut self) -> Result<Table> {
-        // First, flush and finish writing to the file
-        self.finish()?;
         // Create a new `ReadableTable` from the same file path
         let readable = ReadableTable::open(&self.path)?;
         // Return the table in readable mode
@@ -113,7 +108,6 @@ impl WritableTable {
 pub struct ReadableTable {
     file: File,
     index: Index,
-    index_offset: u64,
 }
 
 impl ReadableTable {
@@ -130,21 +124,12 @@ impl ReadableTable {
 
         let index = Index::try_from(index_data.as_slice())?;
 
-        Ok(Self {
-            file,
-            index,
-            index_offset,
-        })
+        Ok(Self { file, index })
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(entry) = self.index.find(key) {
-            let block_offset = entry.offset;
-            let block_size = if let Some(next_offset) = self.index.get(entry.index + 1) {
-                next_offset - block_offset
-            } else {
-                self.index_offset - block_offset
-            };
+            let (block_offset, block_size) = (entry.offset, entry.size);
 
             let mut block_data = vec![0u8; block_size as usize];
             self.file.seek(SeekFrom::Start(block_offset))?;
@@ -156,27 +141,26 @@ impl ReadableTable {
         Ok(None)
     }
 
-    pub fn scan(&self) -> Result<ScanIterator> {
+    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIterator> {
+        let blocks = self.index.range(range);
         let reader = self.file.try_clone()?;
-        ScanIterator::new(reader, &self.index, self.index_offset)
+        ScanIterator::new(reader, blocks)
     }
 }
 
 pub struct ScanIterator {
     reader: File,
-    index: Index,
-    index_offset: u64,
+    blocks: Vec<(u64, u64)>, // Block offset and size
     current_block: Option<Arc<Block>>,
     current_block_iter: Option<BlockIterator>,
     current_block_index: usize,
 }
 
 impl ScanIterator {
-    pub fn new(reader: File, index: &Index, index_offset: u64) -> Result<Self> {
+    pub fn new(reader: File, blocks: Vec<(u64, u64)>) -> Result<Self> {
         Ok(Self {
             reader,
-            index: index.clone(),
-            index_offset,
+            blocks,
             current_block: None,
             current_block_iter: None,
             current_block_index: 0,
@@ -184,22 +168,17 @@ impl ScanIterator {
     }
 
     fn next_block(&mut self) -> Result<()> {
-        if self.current_block_index >= self.index.len() {
-            self.current_block_iter = None; // No more blocks to load
+        if self.current_block_index >= self.blocks.len() {
+            self.current_block_iter = None;
             return Ok(());
         }
 
         // Get the current block's offset and size
-        let block_offset = self.index.get(self.current_block_index).unwrap();
-        let block_size = if self.current_block_index + 1 < self.index.len() {
-            self.index.get(self.current_block_index + 1).unwrap() - block_offset
-        } else {
-            self.index_offset - block_offset
-        };
+        let (offset, size) = self.blocks[self.current_block_index];
 
         // Read the block
-        let mut block_data = vec![0u8; block_size as usize];
-        self.reader.seek(SeekFrom::Start(block_offset))?;
+        let mut block_data = vec![0u8; size as usize];
+        self.reader.seek(SeekFrom::Start(offset))?;
         self.reader.read_exact(&mut block_data)?;
 
         let block = Arc::new(Block::new(block_data)?);
@@ -372,7 +351,9 @@ mod tests {
             _ => panic!("Table did not transition to readable mode"),
         };
 
-        let mut scan_iter = table.scan().expect("Failed to create scan iterator");
+        let mut scan_iter = table
+            .scan(b"application".to_vec()..=b"bandana".to_vec())
+            .expect("Failed to create scan iterator");
 
         for (key, value) in entries {
             let result = scan_iter
