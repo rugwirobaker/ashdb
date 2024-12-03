@@ -154,6 +154,9 @@ impl Block {
     pub fn iter(self: Arc<Self>) -> BlockIterator {
         BlockIterator::new(self)
     }
+    pub fn size(&self) -> usize {
+        self.data.len()
+    }
 }
 
 pub struct BlockIterator {
