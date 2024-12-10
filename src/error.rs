@@ -22,6 +22,7 @@ pub enum Error {
     IndexCorruption(String),
     LockError(io::Error),
     InvalidOperation(String),
+    InvalidRecordType(u8),
 }
 
 impl From<io::Error> for Error {
@@ -50,6 +51,7 @@ impl std::fmt::Display for Error {
             Error::IndexCorruption(msg) => write!(f, "Index corruption: {}", msg),
             Error::LockError(err) => write!(f, "Lock error: {}", err),
             Error::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
+            Error::InvalidRecordType(t) => write!(f, "Invalid record type: {}", t),
         }
     }
 }
