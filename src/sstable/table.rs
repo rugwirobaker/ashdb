@@ -70,6 +70,20 @@ impl Table {
             )),
         }
     }
+
+    pub fn min_key(&self) -> &[u8] {
+        match self {
+            Table::Readable(readable) => readable.min_key(),
+            Table::Writable(_) => unimplemented!(),
+        }
+    }
+
+    pub fn max_key(&self) -> &[u8] {
+        match self {
+            Table::Readable(readable) => readable.max_key(),
+            Table::Writable(_) => unimplemented!(),
+        }
+    }
 }
 
 impl WritableTable {
@@ -145,6 +159,15 @@ impl ReadableTable {
         let blocks = self.index.range(range);
         let reader = self.file.try_clone()?;
         ScanIterator::new(reader, blocks)
+    }
+
+    pub fn min_key(&self) -> &[u8] {
+        // self.index.min_key()
+        unimplemented!()
+    }
+
+    pub fn max_key(&self) -> &[u8] {
+        unimplemented!()
     }
 }
 

@@ -1,50 +1,244 @@
-use super::Store;
+use super::{
+    level::{Level, SSTable},
+    Store,
+};
+
 use crate::{
     error::Result,
     flock::FileLock,
+    manifest::{
+        record::{FileInfo, Operation, Record},
+        Manifest,
+    },
     memtable::{Memtable, MAX_MEMTABLE_SIZE},
-    Error,
+    sstable::table::Table,
+    wal::Wal,
 };
-use std::{cmp::Ordering, collections::BinaryHeap, ops::RangeBounds, path::Path, sync::Arc};
+
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, VecDeque},
+    fs,
+    ops::RangeBounds,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 const LOCK_FILE: &str = "ashdb.lock";
+const MANIFEST_FILE: &str = "manifest.log";
 
 pub struct LsmStore {
-    dir: String,
-    lock: Option<FileLock>,         // Lock file to prevent concurrent access
-    active_memtable: Arc<Memtable>, // Current active Memtable with read/write access
-    frozen_memtables: Vec<Arc<Memtable>>, // Frozen Memtables
+    dir: PathBuf,
+    lock: Option<FileLock>,
+    active_memtable: Arc<Memtable>,
+    frozen_memtables: VecDeque<Arc<Memtable>>,
+    levels: Vec<Level>, // For now, one level
+    manifest: Manifest,
+    next_sstable_id: u64,
+    next_wal_id: u64,
 }
+
+type Memtables = (Arc<Memtable>, VecDeque<Arc<Memtable>>, u64);
 
 impl LsmStore {
     pub fn open(dir: &str) -> Result<Self> {
-        Self::init_db_dir(dir)?;
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir)?;
 
-        let lock_file = FileLock::lock(Path::new(dir).join(LOCK_FILE)).map_err(Error::LockError)?;
+        let lock = FileLock::lock(dir.join(LOCK_FILE))?;
 
-        let active_memtable = Memtable::new(dir, 0)?;
+        // Open or create the manifest
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let manifest = Manifest::new(&manifest_path)?;
+
+        // Recover state from manifest
+        let (levels, next_table_id) = Self::replay_manifest(&dir, &manifest)?;
+
+        // Recover memtables from WAL files
+        let (active_memtable, frozen_memtables, next_wal_id) = Self::recover_memtables(&dir)?;
+
         Ok(Self {
-            dir: dir.to_string(),
-            lock: Some(lock_file),
-            active_memtable: Arc::new(active_memtable),
-            frozen_memtables: Vec::new(),
+            dir,
+            lock: Some(lock),
+            active_memtable,
+            frozen_memtables,
+            levels,
+            manifest,
+            next_sstable_id: next_table_id,
+            next_wal_id,
         })
     }
+}
 
-    // initialize the main database directory
-    fn init_db_dir(dir: &str) -> Result<()> {
-        let paths = [
-            Path::new(dir),
-            &Path::new(dir).join("sstables"),
-            &Path::new(dir).join("wal"),
-            &Path::new(dir).join("metadata"),
-        ];
+impl LsmStore {
+    fn replay_manifest(dir: &Path, manifest: &Manifest) -> Result<(Vec<Level>, u64)> {
+        let mut levels = Vec::new();
+        let mut next_table_id = 0;
 
-        for path in &paths {
-            if !path.exists() {
-                std::fs::create_dir_all(path).map_err(Error::IoError)?;
+        for record in manifest.iter()? {
+            match record? {
+                Record::AddTable {
+                    id,
+                    level,
+                    info,
+                    op_type: _,
+                } => {
+                    while levels.len() <= level as usize {
+                        levels.push(Level::new(levels.len() as u32));
+                    }
+
+                    let path = dir.join(format!("{}.sst", id));
+                    let table = Table::readable(path.to_str().unwrap())?;
+
+                    levels[level as usize].add_sstable(SSTable {
+                        id,
+                        table,
+                        path,
+                        size: info.size,
+                        min_key: info.min_key,
+                        max_key: info.max_key,
+                    });
+
+                    next_table_id = next_table_id.max(id + 1);
+                }
+                Record::DeleteTable {
+                    id,
+                    level,
+                    op_type: _,
+                } => {
+                    if let Some(level) = levels.get_mut(level as usize) {
+                        level.sstables.retain(|t| t.id != id);
+                    }
+                }
             }
         }
+
+        Ok((levels, next_table_id))
+    }
+
+    fn recover_memtables(dir: &Path) -> Result<Memtables> {
+        let wal_dir = dir.join("wal");
+        std::fs::create_dir_all(&wal_dir)?;
+
+        let mut wal_files: Vec<_> = std::fs::read_dir(&wal_dir)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension()?.to_str()? == "wal" {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort WAL files by ID
+        wal_files.sort_by_key(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        });
+
+        let mut frozen_memtables = VecDeque::new();
+        let mut next_wal_id = 0;
+
+        // Process all but the last WAL file into frozen memtables
+        for wal_path in wal_files.iter().rev().skip(1) {
+            let wal_id = wal_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+
+            next_wal_id = next_wal_id.max(wal_id + 1);
+
+            let wal = Wal::new(wal_path.to_str().unwrap())?;
+            let memtable = Memtable::from_wal(wal)?;
+            frozen_memtables.push_back(Arc::new(memtable));
+        }
+
+        // Process the last WAL file as active memtable
+        let active_memtable = match wal_files.last() {
+            Some(active_wal_path) => {
+                let wal_id = active_wal_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                next_wal_id = next_wal_id.max(wal_id + 1);
+
+                let wal = Wal::new(active_wal_path.to_str().unwrap())?;
+                Arc::new(Memtable::from_wal(wal)?)
+            }
+            None => {
+                let wal_id = next_wal_id;
+                next_wal_id += 1;
+                let wal_path = wal_dir.join(format!("{}.wal", wal_id));
+                let wal = Wal::new(wal_path.to_str().unwrap())?;
+                Arc::new(Memtable::new(wal))
+            }
+        };
+
+        Ok((active_memtable, frozen_memtables, next_wal_id))
+    }
+
+    fn flush_memtable(&mut self) -> Result<()> {
+        // Get frozen memtable from queue
+        let memtable = match self.frozen_memtables.pop_front() {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+
+        // Create new SSTable
+        let table_id = self.next_sstable_id;
+        self.next_sstable_id += 1;
+
+        let sstable_path = self.dir.join(format!("{}.sst", table_id));
+        let mut table = Table::writable(sstable_path.to_str().unwrap())?;
+
+        // Flush memtable to SSTable
+        match memtable.flush(&mut table) {
+            Ok(()) => {
+                // Finalize table
+                let table = table.finalize()?;
+
+                // Create FileInfo
+                let file_info = FileInfo {
+                    id: table_id,
+                    size: std::fs::metadata(&sstable_path)?.len(),
+                    min_key: vec![], // TODO: Get from table
+                    max_key: vec![], // TODO: Get from table
+                };
+
+                // Record in manifest
+                self.manifest.append(Record::AddTable {
+                    id: table_id,
+                    level: 0,
+                    info: file_info.clone(),
+                    op_type: Operation::Flush,
+                })?;
+                self.manifest.sync()?;
+
+                // Add table to level 0
+                if self.levels.is_empty() {
+                    self.levels.push(Level::new(0));
+                }
+                self.levels[0].add_sstable(SSTable {
+                    id: table_id,
+                    table,
+                    path: sstable_path,
+                    size: file_info.size,
+                    min_key: file_info.min_key,
+                    max_key: file_info.max_key,
+                });
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+
         Ok(())
     }
 }
@@ -59,17 +253,15 @@ impl Drop for LsmStore {
 
 impl LsmStore {
     pub fn freeze_active_memtable(&mut self) -> Result<()> {
-        // Freeze the current active Memtable
         self.active_memtable.freeze()?;
-        let frozen_memtable = Arc::clone(&self.active_memtable);
-
-        // Push the frozen Memtable to the frozen_memtables list
-        self.frozen_memtables.push(frozen_memtable);
-
-        // Create a new active Memtable
-        let new_memtable_id = self.frozen_memtables.len() as u64;
-        self.active_memtable = Arc::new(Memtable::new(&self.dir, new_memtable_id)?);
-
+        let frozen = Arc::clone(&self.active_memtable);
+        self.frozen_memtables.push_back(frozen);
+        let wal_dir = self.dir.join("wal");
+        std::fs::create_dir_all(&wal_dir)?;
+        let wal_path = wal_dir.join(format!("{}.wal", self.next_wal_id));
+        self.next_wal_id += 1;
+        let wal = Wal::new(wal_path.to_str().unwrap())?;
+        self.active_memtable = Arc::new(Memtable::new(wal));
         Ok(())
     }
 }
@@ -80,7 +272,6 @@ impl Store for LsmStore {
 
     fn set(&mut self, key: &[u8], value: Vec<u8>) -> Result<()> {
         self.active_memtable.put(key.to_vec(), Some(value))?;
-
         // Check size and freeze if necessary
         if self.active_memtable.size() >= MAX_MEMTABLE_SIZE {
             self.freeze_active_memtable()?;

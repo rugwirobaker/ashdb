@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn test_record_invalid_operation_type() {
         let data = vec![
-            0x01, // Record type
+            0x01, //
             0, 0, 0, 0, 0, 0, 0, 1, // id
             0, 0, 0, 0,    // level
             0xFF, // Invalid operation type

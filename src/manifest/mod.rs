@@ -1,4 +1,4 @@
-mod record;
+pub mod record;
 
 use crate::error::Result;
 use crate::Error;

@@ -1,6 +1,7 @@
 pub mod error;
 pub mod flock;
 pub mod hasher;
+pub mod manifest;
 pub mod memtable;
 pub mod multiwriter;
 pub mod sstable;
