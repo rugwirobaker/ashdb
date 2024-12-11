@@ -5,31 +5,10 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use crate::error::Result;
 use crate::Error;
 
-#[derive(Debug, Copy, Clone)]
-#[repr(u8)]
-pub enum RecordType {
-    AddTable = 1,
-    DeleteTable = 2,
-    BeginCompaction = 3,
-    EndCompaction = 4,
-    BeginFlush = 5,
-    EndFlush = 6,
-}
-
-impl TryFrom<u8> for RecordType {
-    type Error = Error;
-
-    fn try_from(value: u8) -> Result<Self> {
-        match value {
-            1 => Ok(RecordType::AddTable),
-            2 => Ok(RecordType::DeleteTable),
-            3 => Ok(RecordType::BeginCompaction),
-            4 => Ok(RecordType::EndCompaction),
-            5 => Ok(RecordType::BeginFlush),
-            6 => Ok(RecordType::EndFlush),
-            _ => Err(Error::InvalidRecordType(value)),
-        }
-    }
+#[derive(Debug, Clone, PartialEq)]
+pub enum Operation {
+    Flush,
+    Compaction { job_id: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,31 +17,22 @@ pub enum Record {
         id: u64,
         level: u32,
         info: FileInfo,
+        op_type: Operation,
     },
     DeleteTable {
         id: u64,
         level: u32,
+        op_type: Operation,
     },
-    BeginCompaction {
-        job_id: u64,
-        input_files: Vec<FileInfo>,
-        source_level: u32,
-        target_level: u32,
-    },
-    EndCompaction {
-        job_id: u64,
-        output_files: Vec<FileInfo>,
-        success: bool,
-    },
-    BeginFlush {
-        memtable_id: u64,
-        wal_id: u64,
-    },
-    EndFlush {
-        memtable_id: u64,
-        output_files: Vec<FileInfo>,
-        success: bool,
-    },
+}
+
+impl Record {
+    fn record_type(&self) -> u8 {
+        match self {
+            Record::AddTable { .. } => 0x01,
+            Record::DeleteTable { .. } => 0x02,
+        }
+    }
 }
 
 impl TryInto<Vec<u8>> for Record {
@@ -70,76 +40,45 @@ impl TryInto<Vec<u8>> for Record {
 
     fn try_into(self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
+        buf.write_u8(self.record_type())?;
+
         match self {
-            Record::AddTable { id, level, info } => {
-                buf.write_u8(RecordType::AddTable as u8)?;
+            Record::AddTable {
+                id,
+                level,
+                info,
+                op_type,
+            } => {
                 buf.write_u64::<BigEndian>(id)?;
                 buf.write_u32::<BigEndian>(level)?;
-                let meta_bytes: Vec<u8> = info.try_into()?;
-                buf.write_u32::<BigEndian>(meta_bytes.len() as u32)?;
-                buf.write_all(&meta_bytes)?;
+
+                // Encode operation type
+                match op_type {
+                    Operation::Flush => {
+                        buf.write_u8(0x01)?; // Changed from 0 to 0x01
+                    }
+                    Operation::Compaction { job_id } => {
+                        buf.write_u8(0x02)?; // Changed from 1 to 0x02
+                        buf.write_u64::<BigEndian>(job_id)?;
+                    }
+                }
+
+                let info_bytes: Vec<u8> = info.try_into()?;
+                buf.write_u32::<BigEndian>(info_bytes.len() as u32)?;
+                buf.write_all(&info_bytes)?;
             }
-            Record::DeleteTable { id, level } => {
-                buf.write_u8(RecordType::DeleteTable as u8)?;
+            Record::DeleteTable { id, level, op_type } => {
                 buf.write_u64::<BigEndian>(id)?;
                 buf.write_u32::<BigEndian>(level)?;
-            }
-            Record::BeginCompaction {
-                job_id,
-                input_files,
-                source_level,
-                target_level,
-            } => {
-                buf.write_u8(RecordType::BeginCompaction as u8)?;
-                buf.write_u64::<BigEndian>(job_id)?;
-                buf.write_u32::<BigEndian>(source_level)?;
-                buf.write_u32::<BigEndian>(target_level)?;
 
-                buf.write_u32::<BigEndian>(input_files.len() as u32)?;
-                for meta in input_files {
-                    let meta_bytes: Vec<u8> = meta.try_into()?;
-                    buf.write_u32::<BigEndian>(meta_bytes.len() as u32)?;
-                    buf.write_all(&meta_bytes)?;
-                }
-            }
-            Record::EndCompaction {
-                job_id,
-                output_files,
-                success,
-            } => {
-                buf.write_u8(RecordType::EndCompaction as u8)?;
-                buf.write_u64::<BigEndian>(job_id)?;
-                buf.write_u8(if success { 1 } else { 0 })?;
-
-                buf.write_u32::<BigEndian>(output_files.len() as u32)?;
-                for meta in output_files {
-                    let meta_bytes: Vec<u8> = meta.try_into()?;
-                    buf.write_u32::<BigEndian>(meta_bytes.len() as u32)?;
-                    buf.write_all(&meta_bytes)?;
-                }
-            }
-            Record::BeginFlush {
-                memtable_id,
-                wal_id,
-            } => {
-                buf.write_u8(RecordType::BeginFlush as u8)?;
-                buf.write_u64::<BigEndian>(memtable_id)?;
-                buf.write_u64::<BigEndian>(wal_id)?;
-            }
-            Record::EndFlush {
-                memtable_id,
-                output_files,
-                success,
-            } => {
-                buf.write_u8(RecordType::EndFlush as u8)?;
-                buf.write_u64::<BigEndian>(memtable_id)?;
-                buf.write_u8(if success { 1 } else { 0 })?;
-
-                buf.write_u32::<BigEndian>(output_files.len() as u32)?;
-                for meta in output_files {
-                    let meta_bytes: Vec<u8> = meta.try_into()?;
-                    buf.write_u32::<BigEndian>(meta_bytes.len() as u32)?;
-                    buf.write_all(&meta_bytes)?;
+                match op_type {
+                    Operation::Flush => {
+                        buf.write_u8(0x01)?; // Changed from 0 to 0x01
+                    }
+                    Operation::Compaction { job_id } => {
+                        buf.write_u8(0x02)?; // Changed from 1 to 0x02
+                        buf.write_u64::<BigEndian>(job_id)?;
+                    }
                 }
             }
         }
@@ -152,96 +91,48 @@ impl TryFrom<&[u8]> for Record {
 
     fn try_from(buf: &[u8]) -> Result<Self> {
         let mut reader = std::io::Cursor::new(buf);
-        let record_type = RecordType::try_from(reader.read_u8()?)?;
-
-        match record_type {
-            RecordType::AddTable => {
+        match reader.read_u8()? {
+            0x01 => {
                 let id = reader.read_u64::<BigEndian>()?;
                 let level = reader.read_u32::<BigEndian>()?;
+
+                // Decode operation type
+                let op_type = match reader.read_u8()? {
+                    0x01 => Operation::Flush,
+                    0x02 => Operation::Compaction {
+                        job_id: reader.read_u64::<BigEndian>()?,
+                    },
+                    n => return Err(Error::InvalidOperationType(n)),
+                };
+
                 let info_len = reader.read_u32::<BigEndian>()? as usize;
                 let mut info_buf = vec![0; info_len];
                 reader.read_exact(&mut info_buf)?;
                 let info = FileInfo::try_from(info_buf.as_slice())?;
 
-                Ok(Record::AddTable { id, level, info })
+                Ok(Record::AddTable {
+                    id,
+                    level,
+                    info,
+                    op_type,
+                })
             }
-            RecordType::DeleteTable => {
+            0x02 => {
                 let id = reader.read_u64::<BigEndian>()?;
                 let level = reader.read_u32::<BigEndian>()?;
 
-                Ok(Record::DeleteTable { id, level })
+                // Decode operation type
+                let op_type = match reader.read_u8()? {
+                    0x01 => Operation::Flush,
+                    0x02 => Operation::Compaction {
+                        job_id: reader.read_u64::<BigEndian>()?,
+                    },
+                    n => return Err(Error::InvalidOperationType(n)),
+                };
+
+                Ok(Record::DeleteTable { id, level, op_type })
             }
-            RecordType::BeginCompaction => {
-                let job_id = reader.read_u64::<BigEndian>()?;
-                let source_level = reader.read_u32::<BigEndian>()?;
-                let target_level = reader.read_u32::<BigEndian>()?;
-
-                let file_count = reader.read_u32::<BigEndian>()? as usize;
-                let mut input_files = Vec::with_capacity(file_count);
-                for _ in 0..file_count {
-                    let meta_len = reader.read_u32::<BigEndian>()? as usize;
-                    let mut meta_buf = vec![0; meta_len];
-                    reader.read_exact(&mut meta_buf)?;
-                    let meta = FileInfo::try_from(meta_buf.as_slice())?;
-                    input_files.push(meta);
-                }
-
-                Ok(Record::BeginCompaction {
-                    job_id,
-                    input_files,
-                    source_level,
-                    target_level,
-                })
-            }
-            RecordType::EndCompaction => {
-                let job_id = reader.read_u64::<BigEndian>()?;
-                let success = reader.read_u8()? != 0;
-
-                let file_count = reader.read_u32::<BigEndian>()? as usize;
-                let mut output_files = Vec::with_capacity(file_count);
-                for _ in 0..file_count {
-                    let meta_len = reader.read_u32::<BigEndian>()? as usize;
-                    let mut meta_buf = vec![0; meta_len];
-                    reader.read_exact(&mut meta_buf)?;
-                    let meta = FileInfo::try_from(meta_buf.as_slice())?;
-                    output_files.push(meta);
-                }
-
-                Ok(Record::EndCompaction {
-                    job_id,
-                    output_files,
-                    success,
-                })
-            }
-            RecordType::BeginFlush => {
-                let memtable_id = reader.read_u64::<BigEndian>()?;
-                let wal_id = reader.read_u64::<BigEndian>()?;
-
-                Ok(Record::BeginFlush {
-                    memtable_id,
-                    wal_id,
-                })
-            }
-            RecordType::EndFlush => {
-                let memtable_id = reader.read_u64::<BigEndian>()?;
-                let success = reader.read_u8()? != 0;
-
-                let file_count = reader.read_u32::<BigEndian>()? as usize;
-                let mut output_files = Vec::with_capacity(file_count);
-                for _ in 0..file_count {
-                    let meta_len = reader.read_u32::<BigEndian>()? as usize;
-                    let mut meta_buf = vec![0; meta_len];
-                    reader.read_exact(&mut meta_buf)?;
-                    let meta = FileInfo::try_from(meta_buf.as_slice())?;
-                    output_files.push(meta);
-                }
-
-                Ok(Record::EndFlush {
-                    memtable_id,
-                    output_files,
-                    success,
-                })
-            }
+            n => Err(Error::InvalidRecordType(n)),
         }
     }
 }
@@ -308,7 +199,6 @@ impl TryFrom<&[u8]> for FileInfo {
 mod tests {
     use super::*;
 
-    // Helper function to create test FileInfo
     fn create_test_file_info() -> FileInfo {
         FileInfo {
             id: 42,
@@ -319,85 +209,73 @@ mod tests {
     }
 
     #[test]
-    fn test_record_add_table_roundtrip() {
+    fn test_record_add_table_flush_roundtrip() {
         let original = Record::AddTable {
             id: 1,
             level: 0,
             info: create_test_file_info(),
+            op_type: Operation::Flush,
         };
 
-        let encoded: Vec<u8> = original.try_into().expect("Failed to encode Record");
+        let encoded: Vec<u8> = original
+            .clone()
+            .try_into()
+            .expect("Failed to encode Record");
         let decoded = Record::try_from(encoded.as_slice()).expect("Failed to decode Record");
 
-        match decoded {
-            Record::AddTable { id, level, info } => {
-                assert_eq!(id, 1);
-                assert_eq!(level, 0);
-                assert_eq!(info.id, 42);
-                assert_eq!(info.size, 1024);
-                assert_eq!(info.min_key, vec![1, 2, 3]);
-                assert_eq!(info.max_key, vec![9, 8, 7]);
-            }
-            _ => panic!("Decoded to wrong variant"),
-        }
+        assert_eq!(decoded, original);
     }
 
     #[test]
-    fn test_record_begin_compaction_roundtrip() {
-        let original = Record::BeginCompaction {
-            job_id: 123,
-            input_files: vec![create_test_file_info(), create_test_file_info()],
-            source_level: 1,
-            target_level: 2,
+    fn test_record_add_table_compaction_roundtrip() {
+        let original = Record::AddTable {
+            id: 1,
+            level: 0,
+            info: create_test_file_info(),
+            op_type: Operation::Compaction { job_id: 123 },
         };
 
-        let encoded: Vec<u8> = original.try_into().expect("Failed to encode Record");
+        let encoded: Vec<u8> = original
+            .clone()
+            .try_into()
+            .expect("Failed to encode Record");
         let decoded = Record::try_from(encoded.as_slice()).expect("Failed to decode Record");
 
-        match decoded {
-            Record::BeginCompaction {
-                job_id,
-                input_files,
-                source_level,
-                target_level,
-            } => {
-                assert_eq!(job_id, 123);
-                assert_eq!(input_files.len(), 2);
-                assert_eq!(source_level, 1);
-                assert_eq!(target_level, 2);
-                for info in input_files {
-                    assert_eq!(info.id, 42);
-                    assert_eq!(info.size, 1024);
-                }
-            }
-            _ => panic!("Decoded to wrong variant"),
-        }
+        assert_eq!(decoded, original);
     }
 
     #[test]
-    fn test_record_end_flush_roundtrip() {
-        let original = Record::EndFlush {
-            memtable_id: 456,
-            output_files: vec![create_test_file_info()],
-            success: true,
+    fn test_record_delete_table_flush_roundtrip() {
+        let original = Record::DeleteTable {
+            id: 1,
+            level: 0,
+            op_type: Operation::Flush,
         };
 
-        let encoded: Vec<u8> = original.try_into().expect("Failed to encode Record");
+        let encoded: Vec<u8> = original
+            .clone()
+            .try_into()
+            .expect("Failed to encode Record");
         let decoded = Record::try_from(encoded.as_slice()).expect("Failed to decode Record");
 
-        match decoded {
-            Record::EndFlush {
-                memtable_id,
-                output_files,
-                success,
-            } => {
-                assert_eq!(memtable_id, 456);
-                assert_eq!(output_files.len(), 1);
-                assert!(success);
-                assert_eq!(output_files[0].id, 42);
-            }
-            _ => panic!("Decoded to wrong variant"),
-        }
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_record_delete_table_compaction_roundtrip() {
+        let original = Record::DeleteTable {
+            id: 1,
+            level: 0,
+            op_type: Operation::Compaction { job_id: 123 },
+        };
+
+        let encoded: Vec<u8> = original
+            .clone()
+            .try_into()
+            .expect("Failed to encode Record");
+        let decoded = Record::try_from(encoded.as_slice()).expect("Failed to decode Record");
+
+        assert_eq!(decoded, original);
     }
 
     #[test]
@@ -409,32 +287,30 @@ mod tests {
     }
 
     #[test]
+    fn test_record_invalid_operation_type() {
+        let data = vec![
+            0x01, // Record type
+            0, 0, 0, 0, 0, 0, 0, 1, // id
+            0, 0, 0, 0,    // level
+            0xFF, // Invalid operation type
+        ];
+        let result = Record::try_from(data.as_slice());
+        assert!(matches!(result, Err(Error::InvalidOperationType(0xFF))));
+    }
+
+    #[test]
     fn test_record_truncated_data() {
         let record = Record::AddTable {
             id: 1,
             level: 0,
             info: create_test_file_info(),
+            op_type: Operation::Flush,
         };
         let mut encoded: Vec<u8> = record.try_into().expect("Failed to encode Record");
         encoded.truncate(encoded.len() - 1); // Remove last byte
 
         let result = Record::try_from(encoded.as_slice());
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_file_info_roundtrip() {
-        let original = create_test_file_info();
-        let encoded: Vec<u8> = original
-            .clone()
-            .try_into()
-            .expect("Failed to encode FileInfo");
-        let decoded = FileInfo::try_from(encoded.as_slice()).expect("Failed to decode FileInfo");
-
-        assert_eq!(decoded.id, original.id);
-        assert_eq!(decoded.size, original.size);
-        assert_eq!(decoded.min_key, original.min_key);
-        assert_eq!(decoded.max_key, original.max_key);
     }
 
     #[test]

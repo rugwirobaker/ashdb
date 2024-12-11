@@ -4,14 +4,16 @@ use crate::error::Result;
 use crate::Error;
 
 use byteorder::{BigEndian, WriteBytesExt};
-use record::Record;
+use record::{FileInfo, Operation, Record};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Manifest {
     file: File,
     writer: BufWriter<File>,
+    next_job_id: AtomicU64,
 }
 
 impl Manifest {
@@ -25,7 +27,13 @@ impl Manifest {
 
         let writer = BufWriter::new(file.try_clone()?);
 
-        Ok(Self { file, writer })
+        let next_job_id = AtomicU64::new(0);
+
+        Ok(Self {
+            file,
+            writer,
+            next_job_id,
+        })
     }
 
     pub fn append(&mut self, record: Record) -> Result<()> {
@@ -53,6 +61,59 @@ impl Manifest {
 
     pub fn iter(&self) -> Result<ManifestIter> {
         ManifestIter::new(self.file.try_clone()?)
+    }
+}
+
+impl Manifest {
+    // Helper for ID generation
+    fn next_job_id(&self) -> u64 {
+        self.next_job_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    // New methods for recording table operations
+    pub fn record_add_table_flush(&mut self, id: u64, level: u32, info: FileInfo) -> Result<()> {
+        self.append(Record::AddTable {
+            id,
+            level,
+            info,
+            op_type: Operation::Flush,
+        })?;
+        self.sync()
+    }
+
+    pub fn record_add_table_compaction(
+        &mut self,
+        id: u64,
+        level: u32,
+        info: FileInfo,
+    ) -> Result<()> {
+        let job_id = self.next_job_id();
+        self.append(Record::AddTable {
+            id,
+            level,
+            info,
+            op_type: Operation::Compaction { job_id },
+        })?;
+        self.sync()
+    }
+
+    pub fn record_delete_table_flush(&mut self, id: u64, level: u32) -> Result<()> {
+        self.append(Record::DeleteTable {
+            id,
+            level,
+            op_type: Operation::Flush,
+        })?;
+        self.sync()
+    }
+
+    pub fn record_delete_table_compaction(&mut self, id: u64, level: u32) -> Result<()> {
+        let job_id = self.next_job_id();
+        self.append(Record::DeleteTable {
+            id,
+            level,
+            op_type: Operation::Compaction { job_id },
+        })?;
+        self.sync()
     }
 }
 
@@ -110,7 +171,7 @@ impl Iterator for ManifestIter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use record::FileInfo;
+    use record::{FileInfo, Operation};
     use tempfile::tempdir;
 
     fn create_test_file_info(id: u64) -> FileInfo {
@@ -126,8 +187,6 @@ mod tests {
     fn test_manifest_basic_operations() -> Result<()> {
         let dir = tempdir()?;
         let manifest_path = dir.path().join("MANIFEST");
-
-        // Create manifest and write some records
         let mut manifest = Manifest::new(&manifest_path)?;
 
         let records = vec![
@@ -135,12 +194,18 @@ mod tests {
                 id: 1,
                 level: 0,
                 info: create_test_file_info(1),
+                op_type: Operation::Flush,
             },
-            Record::BeginCompaction {
-                job_id: 123,
-                input_files: vec![create_test_file_info(1)],
-                source_level: 1,
-                target_level: 2,
+            Record::AddTable {
+                id: 2,
+                level: 1,
+                info: create_test_file_info(2),
+                op_type: Operation::Compaction { job_id: 0 },
+            },
+            Record::DeleteTable {
+                id: 1,
+                level: 0,
+                op_type: Operation::Compaction { job_id: 1 },
             },
         ];
 
@@ -159,18 +224,93 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_flush_operations() -> Result<()> {
+        let dir = tempdir()?;
+        let manifest_path = dir.path().join("MANIFEST");
+        let mut manifest = Manifest::new(&manifest_path)?;
+
+        let info = create_test_file_info(1);
+        manifest.record_add_table_flush(1, 0, info.clone())?;
+        manifest.record_delete_table_flush(1, 0)?;
+
+        let records: Vec<Record> = manifest.iter()?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(records.len(), 2);
+
+        match &records[0] {
+            Record::AddTable {
+                id,
+                level,
+                info: stored_info,
+                op_type,
+            } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*level, 0);
+                assert_eq!(stored_info, &info);
+                assert!(matches!(op_type, Operation::Flush));
+            }
+            _ => panic!("Expected AddTable record"),
+        }
+
+        match &records[1] {
+            Record::DeleteTable { id, level, op_type } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*level, 0);
+                assert!(matches!(op_type, Operation::Flush));
+            }
+            _ => panic!("Expected DeleteTable record"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_manifest_compaction_operations() -> Result<()> {
+        let dir = tempdir()?;
+        let manifest_path = dir.path().join("MANIFEST");
+        let mut manifest = Manifest::new(&manifest_path)?;
+
+        let info = create_test_file_info(1);
+        manifest.record_add_table_compaction(1, 1, info.clone())?;
+        manifest.record_delete_table_compaction(1, 0)?;
+
+        let records: Vec<Record> = manifest.iter()?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(records.len(), 2);
+
+        match &records[0] {
+            Record::AddTable {
+                id,
+                level,
+                info: stored_info,
+                op_type,
+            } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*level, 1);
+                assert_eq!(stored_info, &info);
+                assert!(matches!(op_type, Operation::Compaction { job_id: 0 }));
+            }
+            _ => panic!("Expected AddTable record"),
+        }
+
+        match &records[1] {
+            Record::DeleteTable { id, level, op_type } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*level, 0);
+                assert!(matches!(op_type, Operation::Compaction { job_id: 1 }));
+            }
+            _ => panic!("Expected DeleteTable record"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_manifest_corrupted_record() -> Result<()> {
         let dir = tempdir()?;
         let manifest_path = dir.path().join("MANIFEST");
+        let mut manifest = Manifest::new(&manifest_path)?;
 
         // Write valid record
-        let mut manifest = Manifest::new(&manifest_path)?;
-        manifest.append(Record::AddTable {
-            id: 1,
-            level: 0,
-            info: create_test_file_info(1),
-        })?;
-        manifest.sync()?;
+        manifest.record_add_table_flush(1, 0, create_test_file_info(1))?;
 
         // Corrupt the file by writing random bytes at the end
         let mut file = OpenOptions::new().append(true).open(&manifest_path)?;
@@ -193,176 +333,10 @@ mod tests {
     fn test_manifest_empty() -> Result<()> {
         let dir = tempdir()?;
         let manifest_path = dir.path().join("MANIFEST");
-
         let manifest = Manifest::new(&manifest_path)?;
-        let iter = manifest.iter()?;
-        let records: Vec<Record> = iter.collect::<Result<Vec<_>>>()?;
 
+        let records: Vec<Record> = manifest.iter()?.collect::<Result<Vec<_>>>()?;
         assert!(records.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn test_add_table_record() -> Result<()> {
-        let dir = tempdir()?;
-        let manifest_path = dir.path().join("MANIFEST");
-        let mut manifest = Manifest::new(&manifest_path)?;
-
-        let record = Record::AddTable {
-            id: 1,
-            level: 0,
-            info: create_test_file_info(42),
-        };
-
-        manifest.append(record.clone())?;
-        manifest.sync()?;
-
-        let read_records: Vec<Record> = manifest.iter()?.collect::<Result<Vec<_>>>()?;
-        assert_eq!(read_records, vec![record]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_delete_table_record() -> Result<()> {
-        let dir = tempdir()?;
-        let manifest_path = dir.path().join("MANIFEST");
-        let mut manifest = Manifest::new(&manifest_path)?;
-
-        let record = Record::DeleteTable { id: 1, level: 0 };
-
-        manifest.append(record.clone())?;
-        manifest.sync()?;
-
-        let read_records: Vec<Record> = manifest.iter()?.collect::<Result<Vec<_>>>()?;
-        assert_eq!(read_records, vec![record]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_compaction_records() -> Result<()> {
-        let dir = tempdir()?;
-        let manifest_path = dir.path().join("MANIFEST");
-        let mut manifest = Manifest::new(&manifest_path)?;
-
-        let begin_record = Record::BeginCompaction {
-            job_id: 123,
-            input_files: vec![create_test_file_info(1), create_test_file_info(2)],
-            source_level: 1,
-            target_level: 2,
-        };
-
-        let end_record = Record::EndCompaction {
-            job_id: 123,
-            output_files: vec![create_test_file_info(3)],
-            success: true,
-        };
-
-        manifest.append(begin_record.clone())?;
-        manifest.append(end_record.clone())?;
-        manifest.sync()?;
-
-        let read_records: Vec<Record> = manifest.iter()?.collect::<Result<Vec<_>>>()?;
-        assert_eq!(read_records, vec![begin_record, end_record]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_flush_records() -> Result<()> {
-        let dir = tempdir()?;
-        let manifest_path = dir.path().join("MANIFEST");
-        let mut manifest = Manifest::new(&manifest_path)?;
-
-        let begin_record = Record::BeginFlush {
-            memtable_id: 1,
-            wal_id: 42,
-        };
-
-        let end_record = Record::EndFlush {
-            memtable_id: 1,
-            output_files: vec![create_test_file_info(1)],
-            success: true,
-        };
-
-        manifest.append(begin_record.clone())?;
-        manifest.append(end_record.clone())?;
-        manifest.sync()?;
-
-        let read_records: Vec<Record> = manifest.iter()?.collect::<Result<Vec<_>>>()?;
-        assert_eq!(read_records, vec![begin_record, end_record]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_mixed_records() -> Result<()> {
-        let dir = tempdir()?;
-        let manifest_path = dir.path().join("MANIFEST");
-        let mut manifest = Manifest::new(&manifest_path)?;
-
-        let records = vec![
-            Record::AddTable {
-                id: 1,
-                level: 0,
-                info: create_test_file_info(1),
-            },
-            Record::BeginCompaction {
-                job_id: 123,
-                input_files: vec![create_test_file_info(1)],
-                source_level: 0,
-                target_level: 1,
-            },
-            Record::EndCompaction {
-                job_id: 123,
-                output_files: vec![create_test_file_info(2)],
-                success: true,
-            },
-            Record::DeleteTable { id: 1, level: 0 },
-        ];
-
-        for record in records.clone() {
-            manifest.append(record)?;
-        }
-        manifest.sync()?;
-
-        let read_records: Vec<Record> = manifest.iter()?.collect::<Result<Vec<_>>>()?;
-        assert_eq!(read_records, records);
-        Ok(())
-    }
-
-    #[test]
-    fn test_failed_operations() -> Result<()> {
-        let dir = tempdir()?;
-        let manifest_path = dir.path().join("MANIFEST");
-        let mut manifest = Manifest::new(&manifest_path)?;
-
-        let records = vec![
-            Record::BeginCompaction {
-                job_id: 123,
-                input_files: vec![create_test_file_info(1)],
-                source_level: 0,
-                target_level: 1,
-            },
-            Record::EndCompaction {
-                job_id: 123,
-                output_files: vec![],
-                success: false,
-            },
-            Record::BeginFlush {
-                memtable_id: 1,
-                wal_id: 42,
-            },
-            Record::EndFlush {
-                memtable_id: 1,
-                output_files: vec![],
-                success: false,
-            },
-        ];
-        for record in records.clone() {
-            manifest.append(record)?;
-        }
-        manifest.sync()?;
-
-        let read_records: Vec<Record> = manifest.iter()?.collect::<Result<Vec<_>>>()?;
-        assert_eq!(read_records, records);
         Ok(())
     }
 }
