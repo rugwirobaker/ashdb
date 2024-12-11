@@ -4,7 +4,6 @@ use crate::{wal::Wal, Error};
 use crossbeam_skiplist::{map::Entry, SkipMap};
 use std::{
     ops::{Bound, RangeBounds},
-    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -16,7 +15,6 @@ pub const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024; // 64MB
 
 #[derive(Debug)]
 pub struct Memtable {
-    id: u64,
     data: Arc<SkipMap<Vec<u8>, Option<Vec<u8>>>>, // In-memory key-value store
     wal: Arc<Mutex<Wal>>,                         // Associated Write-Ahead Log
     size: AtomicUsize,                            // Tracks Memtable size
@@ -25,34 +23,18 @@ pub struct Memtable {
 
 impl Memtable {
     /// Creates a new empty Memtable with a new WAL.
-    pub fn new(dir: &str, id: u64) -> Result<Self> {
-        let dir_path = Path::new(dir);
-        if !dir_path.exists() {
-            std::fs::create_dir_all(dir_path).map_err(|e| {
-                Error::IoError(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to create dir: {}", dir),
-                ))
-            })?;
-        }
-        let wal_path = dir_path.join(format!("{:04}.wal", id));
-        let wal = Wal::new(wal_path.to_str().ok_or_else(|| {
-            Error::InvalidWalId("Failed to convert WAL path to string".to_string())
-        })?)?;
-
-        Ok(Self {
-            id,
+    pub fn new(wal: Wal) -> Self {
+        Self {
             data: Arc::new(SkipMap::new()),
             wal: Arc::new(Mutex::new(wal)),
             size: AtomicUsize::new(0),
             is_frozen: AtomicBool::new(false),
-        })
+        }
     }
 
     pub fn from_wal(wal: Wal) -> Result<Self> {
         let data = Arc::new(SkipMap::new());
         let size = AtomicUsize::new(0);
-        let id = wal.id()?;
 
         // Clone the WAL file for replay
         let replay_iter = wal.replay()?;
@@ -69,7 +51,6 @@ impl Memtable {
             wal: Arc::new(Mutex::new(wal)), // Ensure WAL is still usable elsewhere
             size,
             is_frozen: AtomicBool::new(false),
-            id,
         })
     }
 }
@@ -77,7 +58,7 @@ impl Memtable {
 impl Clone for Memtable {
     fn clone(&self) -> Self {
         Memtable {
-            id: self.id,                                                       // Copy the ID directly
+            // Copy the ID directly
             data: Arc::clone(&self.data), // Clone the Arc for shared data
             wal: Arc::clone(&self.wal),   // Clone the Arc for the WAL
             size: AtomicUsize::new(self.size.load(Ordering::SeqCst)), // Initialize a new AtomicUsize with the current size
@@ -120,11 +101,6 @@ impl Memtable {
     /// size returns the size of the Memtable in bytes.
     pub fn size(&self) -> usize {
         self.size.load(Ordering::SeqCst)
-    }
-
-    /// id returns the ID of the Memtable.
-    pub fn id(&self) -> u64 {
-        self.id
     }
 
     /// freeze prevents further writes to the Memtable.
@@ -263,8 +239,9 @@ mod tests {
 
     fn create_temp_memtable(temp_dir: &TempDir) -> Memtable {
         let wal_path = temp_dir.path().join("0000.wal");
-        Memtable::new(wal_path.to_str().expect("Failed to create WAL path"), 0)
-            .expect("Failed to initialize Memtable")
+        let wal = Wal::new(wal_path.to_str().expect("Failed to create WAL path"))
+            .expect("Failed to initialize WAL");
+        Memtable::new(wal)
     }
 
     fn create_temp_wal(temp_dir: &TempDir) -> Wal {
