@@ -23,13 +23,14 @@ pub struct Memtable {
 
 impl Memtable {
     /// Creates a new empty Memtable with a new WAL.
-    pub fn new(wal: Wal) -> Self {
-        Self {
+    pub fn new(wal_path: &str) -> Result<Self> {
+        let wal = Wal::new(wal_path)?;
+        Ok(Self {
             data: Arc::new(SkipMap::new()),
             wal: Arc::new(Mutex::new(wal)),
             size: AtomicUsize::new(0),
             is_frozen: AtomicBool::new(false),
-        }
+        })
     }
 
     pub fn from_wal(wal: Wal) -> Result<Self> {
@@ -237,13 +238,14 @@ mod tests {
         TempDir::new().expect("Failed to create temporary directory")
     }
 
+    // This helper needs updating
     fn create_temp_memtable(temp_dir: &TempDir) -> Memtable {
         let wal_path = temp_dir.path().join("0000.wal");
-        let wal = Wal::new(wal_path.to_str().expect("Failed to create WAL path"))
-            .expect("Failed to initialize WAL");
-        Memtable::new(wal)
+        Memtable::new(wal_path.to_str().expect("Failed to create WAL path"))
+            .expect("Failed to initialize memtable")
     }
 
+    // This helper also needs updating
     fn create_temp_wal(temp_dir: &TempDir) -> Wal {
         let wal_path = temp_dir.path().join("0000.wal");
         Wal::new(wal_path.to_str().expect("Failed to create WAL path"))

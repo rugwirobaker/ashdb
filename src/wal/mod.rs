@@ -63,6 +63,12 @@ impl Wal {
         &self.path
     }
 
+    pub fn remove(self) -> Result<()> {
+        let path = self.path.clone();
+        // File handles are dropped here
+        std::fs::remove_file(path).map_err(Error::IoError)
+    }
+
     /// Returns the numeric ID of the WAL file, derived from its file name.
     pub fn id(&self) -> Result<u64> {
         self.path
