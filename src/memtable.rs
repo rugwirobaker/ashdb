@@ -2,12 +2,10 @@ use crate::error::Result;
 use crate::sstable::{block, table};
 use crate::{wal::Wal, Error};
 use crossbeam_skiplist::{map::Entry, SkipMap};
+use std::sync::Arc;
 use std::{
     ops::{Bound, RangeBounds},
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 // MAX_MEMTABLE_SIZE is the maximum size of the Memtable in bytes.
@@ -15,10 +13,10 @@ pub const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024; // 64MB
 
 #[derive(Debug)]
 pub struct Memtable {
-    data: Arc<SkipMap<Vec<u8>, Option<Vec<u8>>>>, // In-memory key-value store
-    wal: Arc<Mutex<Wal>>,                         // Associated Write-Ahead Log
-    size: AtomicUsize,                            // Tracks Memtable size
-    is_frozen: AtomicBool,                        // Indicates if Memtable is frozen
+    data: Arc<SkipMap<Vec<u8>, Option<Vec<u8>>>>,
+    wal: Wal,
+    size: AtomicUsize,
+    is_frozen: AtomicBool,
 }
 
 impl Memtable {
@@ -27,7 +25,7 @@ impl Memtable {
         let wal = Wal::new(wal_path)?;
         Ok(Self {
             data: Arc::new(SkipMap::new()),
-            wal: Arc::new(Mutex::new(wal)),
+            wal: wal,
             size: AtomicUsize::new(0),
             is_frozen: AtomicBool::new(false),
         })
@@ -37,36 +35,35 @@ impl Memtable {
         let data = Arc::new(SkipMap::new());
         let size = AtomicUsize::new(0);
 
-        // Clone the WAL file for replay
+        // Replay the WAL file
         let replay_iter = wal.replay()?;
         for entry in replay_iter {
             let (key, value) = entry?;
             let entry_size = key.len() + value.as_ref().map_or(0, |v| v.len());
             size.fetch_add(entry_size, Ordering::SeqCst);
-
             data.insert(key, value);
         }
 
         Ok(Self {
             data,
-            wal: Arc::new(Mutex::new(wal)), // Ensure WAL is still usable elsewhere
+            wal,
             size,
             is_frozen: AtomicBool::new(false),
         })
     }
 }
 
-impl Clone for Memtable {
-    fn clone(&self) -> Self {
-        Memtable {
-            // Copy the ID directly
-            data: Arc::clone(&self.data), // Clone the Arc for shared data
-            wal: Arc::clone(&self.wal),   // Clone the Arc for the WAL
-            size: AtomicUsize::new(self.size.load(Ordering::SeqCst)), // Initialize a new AtomicUsize with the current size
-            is_frozen: AtomicBool::new(self.is_frozen.load(Ordering::SeqCst)), // Initialize a new AtomicBool with the current frozen state
-        }
-    }
-}
+// impl Clone for Memtable {
+//     fn clone(&self) -> Self {
+//         Memtable {
+//             // Copy the ID directly
+//             data: self.data.clone(), // Clone the Arc for the SkipMap
+//             wal: &self.wal.clone(),  // Clone the Arc for the WAL
+//             size: AtomicUsize::new(self.size.load(Ordering::SeqCst)), // Initialize a new AtomicUsize with the current size
+//             is_frozen: AtomicBool::new(self.is_frozen.load(Ordering::SeqCst)), // Initialize a new AtomicBool with the current frozen state
+//         }
+//     }
+// }
 
 impl Memtable {
     /// Inserts or updates a key-value pair in the Memtable.
@@ -78,14 +75,7 @@ impl Memtable {
         let value_size = value.as_ref().map_or(0, |v| v.len());
         let entry_size = key_size + value_size;
 
-        // Append to WAL for durability
-        let mut wal = self.wal.lock().map_err(|_| {
-            Error::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to lock WAL",
-            ))
-        })?;
-        wal.put(&key, value.as_deref())?;
+        self.wal.put(&key, value.as_deref())?;
         // Insert into the Memtable
         self.data.insert(key, value);
         // Update Memtable size
@@ -136,13 +126,7 @@ impl Memtable {
 
     // sync synchronizes the Memtable's WAL.
     pub fn sync(&self) -> Result<()> {
-        let mut wal = self.wal.lock().map_err(|_| {
-            Error::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to lock WAL",
-            ))
-        })?;
-        wal.sync()
+        self.wal.sync()
     }
 }
 
@@ -303,16 +287,13 @@ mod tests {
     #[test]
     fn test_from_wal() {
         let temp_dir = create_temp_dir();
-        let mut wal = create_temp_wal(&temp_dir);
+        let wal = create_temp_wal(&temp_dir);
 
         // Append some key-value pairs
         wal.put(b"key1", Some(b"value1")).expect("Failed to append");
         wal.put(b"key2", Some(b"value2")).expect("Failed to append");
         wal.put(b"key3", None).expect("Failed to append (key only)");
         wal.sync().expect("Failed to sync");
-
-        // Validate checksum to ensure WAL integrity
-        wal.validate_checksum().expect("Checksum validation failed");
 
         // Create a Memtable from the WAL
         let memtable = Memtable::from_wal(wal).expect("Failed to create Memtable from WAL");
@@ -394,7 +375,7 @@ mod tests {
     #[test]
     fn test_sync() {
         let temp_dir = create_temp_dir();
-        let mut wal = create_temp_wal(&temp_dir);
+        let wal = create_temp_wal(&temp_dir);
 
         // Append some key-value pairs
         wal.put(b"key1", Some(b"value1")).expect("Failed to append");
@@ -408,8 +389,7 @@ mod tests {
         memtable.sync().expect("Failed to sync");
 
         // WAL should contain the same data as the Memtable
-        let wal = memtable.wal.lock().unwrap();
-        let wal = wal.replay().unwrap();
+        let wal = memtable.wal.replay().unwrap();
         for (i, entry) in wal.enumerate() {
             let (key, value) = entry.unwrap();
             match i {

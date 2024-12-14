@@ -176,8 +176,7 @@ impl LsmStore {
                 let wal_id = next_wal_id;
                 next_wal_id += 1;
                 let wal_path = wal_dir.join(format!("{}.wal", wal_id));
-                let wal = Wal::new(wal_path.to_str().unwrap())?;
-                Arc::new(Memtable::new(wal))
+                Arc::new(Memtable::new(wal_path.to_str().unwrap())?)
             }
         };
 
@@ -260,8 +259,7 @@ impl LsmStore {
         std::fs::create_dir_all(&wal_dir)?;
         let wal_path = wal_dir.join(format!("{}.wal", self.next_wal_id));
         self.next_wal_id += 1;
-        let wal = Wal::new(wal_path.to_str().unwrap())?;
-        self.active_memtable = Arc::new(Memtable::new(wal));
+        self.active_memtable = Arc::new(Memtable::new(wal_path.to_str().unwrap())?);
         Ok(())
     }
 }
