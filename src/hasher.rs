@@ -1,13 +1,9 @@
 use std::fmt;
 
-use crc::{Algorithm, Crc};
-
-pub const CRC_64_ECMA: Algorithm<u64> = crc::CRC_64_ECMA_182; // Use the desired algorithm
-
+use crc64fast::Digest;
 #[derive(Clone)]
 pub struct Hasher {
-    crc64: Crc<u64>,
-    buffer: Vec<u8>, // Add a buffer to store data
+    crc64: Digest,
 }
 
 impl fmt::Debug for Hasher {
@@ -19,21 +15,20 @@ impl fmt::Debug for Hasher {
 impl Hasher {
     pub fn new() -> Self {
         Self {
-            crc64: Crc::<u64>::new(&CRC_64_ECMA),
-            buffer: Vec::new(),
+            crc64: Digest::new(),
         }
     }
 
     pub fn write(&mut self, data: &[u8]) {
-        self.buffer.extend_from_slice(data);
+        self.crc64.write(data);
     }
 
     pub fn checksum(&self) -> u64 {
-        self.crc64.checksum(&self.buffer)
+        self.crc64.sum64()
     }
 
     pub fn reset(&mut self) {
-        self.buffer.clear();
+        self.crc64 = Digest::new();
     }
 }
 

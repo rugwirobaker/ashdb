@@ -1,9 +1,9 @@
 pub mod record;
 
 use crate::error::Result;
-use crate::Error;
+use crate::{Error, Hasher};
 
-use byteorder::{BigEndian, WriteBytesExt};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use record::{FileInfo, Operation, Record};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -37,18 +37,17 @@ impl Manifest {
     }
 
     pub fn append(&mut self, record: Record) -> Result<()> {
-        let record_bytes: Vec<u8> = record.try_into()?;
+        let rec_bytes: Vec<u8> = record.try_into()?;
 
         // Compute checksum properly using Digest
-        let mut digest = crc64fast::Digest::new();
-        digest.write(&record_bytes);
-        let checksum = digest.sum64();
+        let mut hasher = Hasher::new();
+        hasher.write(&rec_bytes);
+        let checksum = hasher.checksum();
 
-        // Write in format: [length:u32][checksum:u64][record:bytes]
-        self.writer
-            .write_u32::<BigEndian>(record_bytes.len() as u32)?;
+        // Write in format: [length:u32][record:bytes][checksum:u64]
+        self.writer.write_u32::<BigEndian>(rec_bytes.len() as u32)?;
+        self.writer.write_all(&rec_bytes)?;
         self.writer.write_u64::<BigEndian>(checksum)?;
-        self.writer.write_all(&record_bytes)?;
 
         Ok(())
     }
@@ -134,27 +133,22 @@ impl Iterator for ManifestIter {
     type Item = Result<Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Read record length
-        let mut len_buf = [0u8; 4];
-        match self.file.read_exact(&mut len_buf) {
-            Ok(_) => {}
+        let record_len = match self.file.read_u32::<BigEndian>() {
+            Ok(len) => len as usize,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
             Err(e) => return Some(Err(e.into())),
-        }
+        };
 
-        // Read checksum
-        let mut checksum_buf = [0u8; 8];
-        if let Err(e) = self.file.read_exact(&mut checksum_buf) {
-            return Some(Err(e.into()));
-        }
-        let stored_checksum = u64::from_be_bytes(checksum_buf);
-
-        // Read record
-        let record_len = u32::from_be_bytes(len_buf) as usize;
         let mut record_buf = vec![0u8; record_len];
         if let Err(e) = self.file.read_exact(&mut record_buf) {
             return Some(Err(e.into()));
         }
+
+        // Read checksum
+        let stored_checksum = match self.file.read_u64::<BigEndian>() {
+            Ok(checksum) => checksum,
+            Err(e) => return Some(Err(e.into())),
+        };
 
         // Verify checksum
         let mut digest = crc64fast::Digest::new();
