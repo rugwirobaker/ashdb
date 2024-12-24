@@ -16,7 +16,7 @@ pub struct Memtable {
     data: Arc<SkipMap<Vec<u8>, Option<Vec<u8>>>>,
     wal: Wal,
     size: AtomicUsize,
-    is_frozen: AtomicBool,
+    frozen: AtomicBool,
 }
 
 impl Memtable {
@@ -27,7 +27,7 @@ impl Memtable {
             data: Arc::new(SkipMap::new()),
             wal: wal,
             size: AtomicUsize::new(0),
-            is_frozen: AtomicBool::new(false),
+            frozen: AtomicBool::new(false),
         })
     }
 
@@ -48,7 +48,7 @@ impl Memtable {
             data,
             wal,
             size,
-            is_frozen: AtomicBool::new(false),
+            frozen: AtomicBool::new(false),
         })
     }
 }
@@ -68,7 +68,7 @@ impl Memtable {
 impl Memtable {
     /// Inserts or updates a key-value pair in the Memtable.
     pub fn put(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
-        if self.is_frozen.load(Ordering::SeqCst) {
+        if self.frozen.load(Ordering::SeqCst) {
             return Err(Error::Frozen);
         }
         let key_size = key.len();
@@ -96,10 +96,14 @@ impl Memtable {
 
     /// freeze prevents further writes to the Memtable.
     pub fn freeze(&self) -> Result<()> {
-        if self.is_frozen.swap(true, Ordering::SeqCst) {
+        if self.frozen.swap(true, Ordering::SeqCst) {
             return Err(Error::Frozen);
         }
         Ok(())
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::SeqCst)
     }
 
     // Scan range of keys
