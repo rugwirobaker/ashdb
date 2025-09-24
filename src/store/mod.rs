@@ -1,5 +1,12 @@
 pub mod level;
 pub mod lsm;
+pub mod state;
+
+// Background tasks
+pub mod compaction;
+pub mod flush;
+pub mod metrics;
+pub mod wal_cleanup;
 
 use crate::error::Result;
 use std::ops::RangeBounds;
@@ -11,7 +18,7 @@ pub trait Store {
         Self: 'a;
 
     /// Inserts or updates a key-value pair.
-    fn set(&mut self, key: &[u8], value: Vec<u8>) -> Result<()>;
+    fn set(&self, key: &[u8], value: Vec<u8>) -> Result<()>;
 
     /// Retrieves the value for a given key.
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
@@ -34,6 +41,9 @@ pub trait Store {
         };
         self.scan((start, end))
     }
+
+    /// Flushes any pending writes to disk.
+    fn flush(&self) -> Result<()>;
 }
 
 pub trait ScanIterator: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}

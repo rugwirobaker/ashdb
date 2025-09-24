@@ -24,6 +24,13 @@ pub enum Error {
     InvalidOperation(String),
     InvalidRecordType(u8),
     InvalidOperationType(u8),
+    InvalidWalMagic,
+    UnsupportedWalVersion(u32),
+    InvalidAlignment,
+    InvalidManifestMagic,
+    UnsupportedManifestVersion(u32),
+    InvalidEditType(u8),
+    CorruptedManifest(String),
 }
 
 impl From<io::Error> for Error {
@@ -54,6 +61,15 @@ impl std::fmt::Display for Error {
             Error::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
             Error::InvalidRecordType(t) => write!(f, "Invalid record type: {}", t),
             Error::InvalidOperationType(t) => write!(f, "Invalid operation type: {}", t),
+            Error::InvalidWalMagic => write!(f, "Invalid WAL magic number"),
+            Error::UnsupportedWalVersion(v) => write!(f, "Unsupported WAL version: {}", v),
+            Error::InvalidAlignment => write!(f, "Invalid alignment for O_DIRECT"),
+            Error::InvalidManifestMagic => write!(f, "Invalid manifest magic number"),
+            Error::UnsupportedManifestVersion(v) => {
+                write!(f, "Unsupported manifest version: {}", v)
+            }
+            Error::InvalidEditType(t) => write!(f, "Invalid edit type: {}", t),
+            Error::CorruptedManifest(msg) => write!(f, "Corrupted manifest: {}", msg),
         }
     }
 }

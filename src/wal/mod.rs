@@ -1,4 +1,6 @@
+pub mod aligned_writer;
 pub mod header;
+pub mod recovery;
 
 use byteorder::BigEndian;
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -7,57 +9,105 @@ use header::HEADER_SIZE;
 
 use crate::error::Result;
 use crate::Error;
-use crate::Hasher;
 
+use aligned_writer::AlignedWriter;
+use crc::{Crc, CRC_32_ISCSI};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::RwLock;
 
+/// Type alias for WAL entry data (key, optional value)
+type WalEntry = (Vec<u8>, Option<Vec<u8>>);
+
+pub const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
+
+pub struct WalOptions {
+    pub use_direct_io: bool,
+    pub buffer_size: usize,
+}
+
+impl Default for WalOptions {
+    fn default() -> Self {
+        Self {
+            use_direct_io: false,
+            buffer_size: DEFAULT_BUFFER_SIZE,
+        }
+    }
+}
+
 // Represents a key-value pair or a delete operation in the WAL
 
-#[derive(Debug)]
+impl std::fmt::Debug for Wal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wal")
+            .field("path", &self.path)
+            .field("direct_io", &self.direct_io)
+            .finish()
+    }
+}
+
 pub struct Wal {
-    writer: Mutex<BufWriter<File>>,
-    header: RwLock<Header>,
     file: File,
+    writer: Mutex<Box<dyn Write + Send>>,
     path: PathBuf,
+    header: RwLock<Header>,
+    direct_io: bool,
 }
 
 impl Wal {
     pub fn new(path: &str) -> Result<Self> {
-        let path = PathBuf::from(path);
+        Self::with_options(path, WalOptions::default())
+    }
 
-        let file = File::options()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
+    pub fn with_options(path: &str, opts: WalOptions) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
 
-        let mut writer = BufWriter::new(file.try_clone()?);
+        if opts.use_direct_io && opts.buffer_size % 4096 != 0 {
+            return Err(Error::InvalidAlignment);
+        }
 
-        // Use a local BufReader to read the header
-        let mut reader = BufReader::new(file.try_clone()?);
-        let mut buf = vec![0u8; HEADER_SIZE];
-        let header = match reader.read_exact(&mut buf) {
-            Ok(_) => Header::try_from(&buf)?, // Successfully read and parse the header
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // If the file is empty or incomplete, create a default header
-                let header = Header::new(1); // Default version
-                let bytes: Vec<u8> = header.try_into().unwrap();
-                writer.write_all(&bytes)?;
-                writer.flush()?; // Flush header to disk
-                header
-            }
-            Err(e) => return Err(Error::IoError(e)), // Propagate other errors
+        let mut open_opts = File::options();
+        open_opts.create(true).read(true).write(true);
+
+        #[cfg(target_os = "linux")]
+        if opts.use_direct_io {
+            open_opts.custom_flags(libc::O_DIRECT);
+        }
+
+        let file = open_opts.open(path)?;
+
+        let writer: Box<dyn Write + Send> = if opts.use_direct_io {
+            Box::new(AlignedWriter::new(file.try_clone()?, opts.buffer_size)?)
+        } else {
+            Box::new(BufWriter::with_capacity(
+                opts.buffer_size,
+                file.try_clone()?,
+            ))
+        };
+
+        let header = if file.metadata()?.len() == 0 {
+            let h = Header::new();
+            let header_bytes = h.encode();
+            let mut f = file.try_clone()?;
+            f.write_all(&header_bytes)?;
+            f.sync_all()?;
+            h
+        } else {
+            let mut buf = [0u8; HEADER_SIZE];
+            let mut reader = file.try_clone()?;
+            reader.read_exact(&mut buf)?;
+            Header::decode(&buf)?
         };
 
         Ok(Self {
-            writer: Mutex::new(writer),
-            header: RwLock::new(header),
             file,
-            path,
+            writer: Mutex::new(writer),
+            path: path.into(),
+            header: RwLock::new(header),
+            direct_io: opts.use_direct_io,
         })
     }
 
@@ -92,26 +142,23 @@ impl Wal {
 }
 
 impl Wal {
-    /// Appends a key-value pair to the WAL file.
-    pub fn put(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+    pub fn append(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        let mut payload = Vec::new();
+        payload.write_u32::<BigEndian>(key.len() as u32)?;
+        payload.write_u32::<BigEndian>(value.map_or(0, |v| v.len()) as u32)?;
+        payload.extend_from_slice(key);
+        if let Some(v) = value {
+            payload.extend_from_slice(v);
+        }
+
+        let checksum = CRC32.checksum(&payload);
+
         let mut writer = self.writer.lock().map_err(|_| Error::MutexPoisoned)?;
 
-        // Write key length and key
-        writer.write_u32::<BigEndian>(key.len() as u32)?;
-        writer.write_all(key)?;
+        writer.write_u32::<BigEndian>(payload.len() as u32)?;
+        writer.write_all(&payload)?;
+        writer.write_u32::<BigEndian>(checksum)?;
 
-        // Write value length and value if present
-        let value_data = value.unwrap_or(&[]);
-        writer.write_u32::<BigEndian>(value_data.len() as u32)?;
-        writer.write_all(value_data)?;
-
-        // Calculate and write entry checksum
-        let mut hasher = Hasher::new();
-        hasher.write(key);
-        hasher.write(value_data);
-        writer.write_u64::<BigEndian>(hasher.checksum())?;
-
-        // Update entry count in header (only once)
         self.header
             .write()
             .map_err(|_| Error::MutexPoisoned)?
@@ -122,26 +169,25 @@ impl Wal {
 
     /// Replays the WAL file and returns a list of key-value pairs.
     pub fn replay(&self) -> Result<ReplayIterator> {
-        let reader = BufReader::new(self.file.try_clone()?);
-        ReplayIterator::new(reader)
+        ReplayIterator::new(&self.path)
     }
 
-    /// Syncs the WAL file to disk.
-    pub fn sync(&self) -> Result<()> {
-        // Flush the writer to ensure all data is written
+    pub fn flush(&self) -> Result<()> {
         self.writer
             .lock()
             .map_err(|_| Error::MutexPoisoned)?
             .flush()?;
 
-        // Update and persist the checksum in the header
-        // Write updated header
         let header = self.header.read().map_err(|_| Error::MutexPoisoned)?;
-        let header_bytes: Vec<u8> = header.clone().try_into()?;
-        let mut writer = self.writer.lock().map_err(|_| Error::MutexPoisoned)?;
-        writer.get_mut().seek(SeekFrom::Start(0))?;
-        writer.write_all(&header_bytes)?;
-        writer.flush()?;
+        let header_bytes = header.encode();
+        drop(header);
+
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header_bytes)?;
+
+        file.sync_all()?;
+
         Ok(())
     }
 }
@@ -151,7 +197,9 @@ pub struct ReplayIterator {
 }
 
 impl ReplayIterator {
-    pub fn new(mut reader: BufReader<File>) -> Result<Self> {
+    pub fn new(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
         reader
             .get_mut()
             .seek(SeekFrom::Start(HEADER_SIZE as u64))
@@ -162,84 +210,65 @@ impl ReplayIterator {
 }
 
 impl ReplayIterator {
-    fn read<R: Read>(reader: &mut R) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>> {
-        // Read key length
-        let key_length = match reader.read_u32::<BigEndian>() {
+    fn read<R: Read>(reader: &mut R) -> Result<Option<WalEntry>> {
+        let record_len = match reader.read_u32::<BigEndian>() {
             Ok(len) => len as usize,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(None); // Clean EOF
+                return Ok(None);
             }
             Err(e) => return Err(Error::IoError(e)),
         };
 
-        // Read key
-        let mut key = vec![0u8; key_length];
-        match reader.read_exact(&mut key) {
-            Ok(_) => (),
-            Err(e) => {
-                return match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => Err(Error::CorruptedWal(
-                        "Unexpected EOF while reading key".to_string(),
-                    )),
-                    _ => Err(Error::IoError(e)),
-                };
-            }
-        }
-
-        let value_length = match reader.read_u32::<BigEndian>() {
-            Ok(len) => len as usize,
-            Err(e) => {
-                return match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => Err(Error::CorruptedWal(
-                        "Unexpected EOF while reading value length".to_string(),
-                    )),
-                    _ => Err(Error::IoError(e)),
-                };
-            }
-        };
-
-        let value = match value_length {
-            0 => None,
-            _ => {
-                let mut value = vec![0u8; value_length];
-                match reader.read_exact(&mut value) {
-                    Ok(_) => Some(value),
-                    Err(e) => {
-                        return match e.kind() {
-                            std::io::ErrorKind::UnexpectedEof => Err(Error::CorruptedWal(
-                                "Unexpected EOF while reading value".to_string(),
-                            )),
-                            _ => Err(Error::IoError(e)),
-                        };
-                    }
-                }
-            }
-        };
-
-        // Read and verify checksum
-        let stored_checksum = match reader.read_u64::<BigEndian>() {
-            Ok(checksum) => checksum,
-            Err(e) => {
-                return match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => Err(Error::CorruptedWal(
-                        "Unexpected EOF while reading checksum".to_string(),
-                    )),
-                    _ => Err(Error::IoError(e)),
-                };
-            }
-        };
-
-        let mut hasher = Hasher::new();
-        hasher.write(&key);
-        hasher.write(value.as_deref().unwrap_or(&[]));
-        let computed_checksum = hasher.checksum();
-
-        if computed_checksum != stored_checksum {
+        let mut payload = vec![0u8; record_len];
+        if let Err(e) = reader.read_exact(&mut payload) {
             return Err(Error::CorruptedWal(format!(
-                "Entry checksum mismatch: stored={}, computed={}",
-                stored_checksum, computed_checksum
+                "Failed to read payload: {}",
+                e
             )));
         }
+
+        let stored_crc = match reader.read_u32::<BigEndian>() {
+            Ok(crc) => crc,
+            Err(e) => {
+                return Err(Error::CorruptedWal(format!(
+                    "Failed to read checksum: {}",
+                    e
+                )))
+            }
+        };
+
+        let computed_crc = CRC32.checksum(&payload);
+        if computed_crc != stored_crc {
+            return Err(Error::ChecksumMismatch);
+        }
+
+        let mut cursor = Cursor::new(&payload);
+
+        let key_len = match cursor.read_u32::<BigEndian>() {
+            Ok(len) => len as usize,
+            Err(e) => return Err(e.into()),
+        };
+
+        let value_len = match cursor.read_u32::<BigEndian>() {
+            Ok(len) => len as usize,
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut key = vec![0u8; key_len];
+        if let Err(e) = cursor.read_exact(&mut key) {
+            return Err(Error::CorruptedWal(format!("Failed to read key: {}", e)));
+        }
+
+        let value = if value_len > 0 {
+            let mut v = vec![0u8; value_len];
+            if let Err(e) = cursor.read_exact(&mut v) {
+                return Err(Error::CorruptedWal(format!("Failed to read value: {}", e)));
+            }
+            Some(v)
+        } else {
+            None
+        };
+
         Ok(Some((key, value)))
     }
 }
@@ -259,28 +288,36 @@ impl Iterator for ReplayIterator {
 #[cfg(test)]
 mod tests {
     use super::Wal;
-    use crate::{wal::header::HEADER_SIZE, Error};
+    use crate::{tmpfs::NamedTempFile, wal::header::HEADER_SIZE, Error};
     use std::io::{Seek, SeekFrom, Write};
-    use tempfile::NamedTempFile;
 
     fn create_temp_wal() -> Wal {
         let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
-        Wal::new(temp_file.path().to_str().unwrap()).expect("Failed to initialize WAL")
+        let path = temp_file.path().to_string_lossy().to_string();
+
+        // Create the WAL which will create the actual file
+        let wal = Wal::new(&path).expect("Failed to initialize WAL");
+
+        // Don't drop temp_file yet - keep it alive by forgetting it
+        // This prevents the file from being deleted
+        std::mem::forget(temp_file);
+
+        wal
     }
 
     #[test]
-    fn test_append_and_sync() {
+    fn test_append_and_flush() {
         let wal = create_temp_wal();
 
-        // Append some key-value pairs
-        wal.put(b"key1", Some(b"value1")).expect("Failed to append");
-        wal.put(b"key2", Some(b"value2")).expect("Failed to append");
-        wal.put(b"key3", None).expect("Failed to append (key only)");
+        wal.append(b"key1", Some(b"value1"))
+            .expect("Failed to append");
+        wal.append(b"key2", Some(b"value2"))
+            .expect("Failed to append");
+        wal.append(b"key3", None)
+            .expect("Failed to append (key only)");
 
-        // Sync to ensure data is flushed and header is updated
-        wal.sync().expect("Failed to sync");
+        wal.flush().expect("Failed to flush");
 
-        // Check that the header contains the correct entry count
         assert_eq!(wal.entry_count(), 3);
     }
 
@@ -288,12 +325,12 @@ mod tests {
     fn test_replay_iterator() {
         let wal = create_temp_wal();
 
-        // Append some key-value pairs
-        wal.put(b"key1", Some(b"value1")).expect("Failed to append");
-        wal.put(b"key2", Some(b"value2")).expect("Failed to append");
-        wal.sync().expect("Failed to sync");
+        wal.append(b"key1", Some(b"value1"))
+            .expect("Failed to append");
+        wal.append(b"key2", Some(b"value2"))
+            .expect("Failed to append");
+        wal.flush().expect("Failed to flush");
 
-        // Replay and verify entries
         let replay_iter = wal.replay().expect("Failed to create replay iterator");
         let entries: Vec<_> = replay_iter
             .collect::<Result<Vec<_>, _>>()
@@ -317,31 +354,29 @@ mod tests {
     fn test_corrupted_wal() {
         let mut wal = create_temp_wal();
 
-        // Append some key-value pairs
-        wal.put(b"key1", Some(b"value1")).expect("Failed to append");
-        wal.put(b"key2", Some(b"value2")).expect("Failed to append");
-        wal.sync().expect("Failed to sync");
+        wal.append(b"key1", Some(b"value1"))
+            .expect("Failed to append");
+        wal.append(b"key2", Some(b"value2"))
+            .expect("Failed to append");
+        wal.flush().expect("Failed to flush");
 
-        // Corrupt the WAL by overwriting part of the valid data
         wal.file
             .seek(SeekFrom::Start(HEADER_SIZE as u64 + 5))
-            .unwrap(); // Corrupt middle of first entry
+            .unwrap();
         wal.file.write_all(b"garbage").unwrap();
-        wal.sync().unwrap();
+        wal.flush().unwrap();
 
-        // Replay entries
-        let mut replay_iter = wal.replay().expect("Failed to create replay iterator");
+        let replay_iter = wal.replay().expect("Failed to create replay iterator");
         let mut has_corruption = false;
 
-        while let Some(entry) = replay_iter.next() {
+        for entry in replay_iter {
             match entry {
-                Err(Error::CorruptedWal(msg)) => {
-                    println!("Detected corruption: {}", msg);
+                Err(Error::CorruptedWal(_)) | Err(Error::ChecksumMismatch) => {
                     has_corruption = true;
                     break;
                 }
                 Err(e) => panic!("Unexpected error during replay: {:?}", e),
-                Ok(_) => {} // Valid entry, continue
+                Ok(_) => {}
             }
         }
         assert!(has_corruption, "Corruption not detected during replay");
@@ -351,20 +386,16 @@ mod tests {
     fn test_key_only_entries() {
         let wal = create_temp_wal();
 
-        // Append key-only entries
-        wal.put(b"key1", None).expect("Failed to append");
-        wal.put(b"key2", None).expect("Failed to append");
+        wal.append(b"key1", None).expect("Failed to append");
+        wal.append(b"key2", None).expect("Failed to append");
 
-        // Sync the WAL
-        wal.sync().expect("Failed to sync");
+        wal.flush().expect("Failed to flush");
 
-        // Replay entries
         let replay_iter = wal.replay().expect("Failed to create replay iterator");
         let entries: Vec<_> = replay_iter
             .collect::<Result<Vec<_>, _>>()
             .expect("Replay failed");
 
-        // Verify the entries
         assert_eq!(entries.len(), 2, "Unexpected number of entries replayed");
         assert_eq!(entries[0], (b"key1".to_vec(), None));
         assert_eq!(entries[1], (b"key2".to_vec(), None));
@@ -375,18 +406,16 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        // Create and populate a WAL file
         let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
         let wal = Wal::new(temp_file.path().to_str().unwrap()).expect("Failed to initialize WAL");
 
-        // Write some test data
         for i in 0..100 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
-            wal.put(key.as_bytes(), Some(value.as_bytes()))
+            wal.append(key.as_bytes(), Some(value.as_bytes()))
                 .expect("Failed to write");
         }
-        wal.sync().expect("Failed to sync");
+        wal.flush().expect("Failed to flush");
 
         // Create multiple readers through cloning
         let wal = Arc::new(wal);

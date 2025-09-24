@@ -1,28 +1,37 @@
 use crate::error::Result;
 use crate::Error;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
 
-// 14 bytes
-pub const HEADER_SIZE: usize = 22;
+pub const HEADER_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Header {
-    pub magic_number: u32,
-    pub version: u16,
+    pub magic: [u8; 8],
+    pub version: u32,
     pub entry_count: u64,
-    pub checksum: u64,
 }
+
+const MAGIC: &[u8; 8] = b"ASHDB\x00WL";
+const VERSION: u32 = 1;
 
 impl Header {
     #[allow(clippy::new_without_default)]
-    pub fn new(version: u16) -> Self {
+    pub fn new() -> Self {
         Header {
-            magic_number: 0x57_41_4C, // ASCII "WAL"
-            version,
+            magic: *MAGIC,
+            version: VERSION,
             entry_count: 0,
-            checksum: 0,
         }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.magic != *MAGIC {
+            return Err(Error::InvalidWalMagic);
+        }
+        if self.version != VERSION {
+            return Err(Error::UnsupportedWalVersion(self.version));
+        }
+        Ok(())
     }
 }
 
@@ -31,10 +40,7 @@ impl TryInto<Vec<u8>> for Header {
     type Error = Error;
 
     fn try_into(self) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(HEADER_SIZE);
-        let mut encoder = HeaderEncoder::new(&mut buf);
-        encoder.encode(&self)?;
-        Ok(buf)
+        Ok(self.encode().to_vec())
     }
 }
 
@@ -42,10 +48,7 @@ impl TryInto<Vec<u8>> for &Header {
     type Error = Error;
 
     fn try_into(self) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(HEADER_SIZE);
-        let mut encoder = HeaderEncoder::new(&mut buf);
-        encoder.encode(self)?;
-        Ok(buf)
+        Ok(self.encode().to_vec())
     }
 }
 
@@ -56,8 +59,7 @@ impl TryFrom<&[u8]> for Header {
         if bytes.len() < HEADER_SIZE {
             return Err(Error::InvalidHeader);
         }
-        let mut decoder = HeaderDecoder::new(bytes);
-        decoder.decode()
+        Header::decode(&bytes[..HEADER_SIZE].try_into().unwrap())
     }
 }
 
@@ -69,74 +71,33 @@ impl TryFrom<&Vec<u8>> for Header {
     }
 }
 
-// Header decoder
-pub struct HeaderDecoder<R: Read> {
-    reader: R,
-}
-
-impl<R: Read> HeaderDecoder<R> {
-    pub fn new(reader: R) -> Self {
-        HeaderDecoder { reader }
+impl Header {
+    pub fn encode(&self) -> [u8; HEADER_SIZE] {
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0..8].copy_from_slice(&self.magic);
+        (&mut buf[8..12])
+            .write_u32::<BigEndian>(self.version)
+            .unwrap();
+        (&mut buf[12..20])
+            .write_u64::<BigEndian>(self.entry_count)
+            .unwrap();
+        buf
     }
 
-    pub fn decode(&mut self) -> Result<Header> {
-        let magic_number = self
-            .reader
-            .read_u32::<BigEndian>()
-            .map_err(|e| Error::Decode("magic_number", e))?;
+    pub fn decode(buf: &[u8; HEADER_SIZE]) -> Result<Self> {
+        let mut magic = [0u8; 8];
+        magic.copy_from_slice(&buf[0..8]);
 
-        let version = self
-            .reader
-            .read_u16::<BigEndian>()
-            .map_err(|e| Error::Decode("version", e))?;
+        let version = (&buf[8..12]).read_u32::<BigEndian>()?;
+        let entry_count = (&buf[12..20]).read_u64::<BigEndian>()?;
 
-        let entry_count = self
-            .reader
-            .read_u64::<BigEndian>()
-            .map_err(|e| Error::Decode("entry_count", e))?;
-
-        let checksum = self
-            .reader
-            .read_u64::<BigEndian>()
-            .map_err(|e| Error::Decode("checksum", e))?;
-
-        Ok(Header {
-            magic_number,
+        let header = Self {
+            magic,
             version,
             entry_count,
-            checksum,
-        })
-    }
-}
-
-// Header encoder
-pub struct HeaderEncoder<W: Write> {
-    writer: W,
-}
-
-impl<W: Write> HeaderEncoder<W> {
-    pub fn new(writer: W) -> Self {
-        HeaderEncoder { writer }
-    }
-
-    pub fn encode(&mut self, header: &Header) -> Result<()> {
-        self.writer
-            .write_u32::<BigEndian>(header.magic_number)
-            .map_err(|e| Error::Encode("magic_number", e))?;
-
-        self.writer
-            .write_u16::<BigEndian>(header.version)
-            .map_err(|e| Error::Encode("version", e))?;
-
-        self.writer
-            .write_u64::<BigEndian>(header.entry_count)
-            .map_err(|e| Error::Encode("entry_count", e))?;
-
-        self.writer
-            .write_u64::<BigEndian>(header.checksum)
-            .map_err(|e| Error::Encode("checksum", e))?;
-
-        Ok(())
+        };
+        header.validate()?;
+        Ok(header)
     }
 }
 
@@ -146,70 +107,45 @@ mod tests {
 
     #[test]
     fn test_header_encoding_decoding() {
-        // Create a sample Header
-        let header = Header {
-            magic_number: 0x57_41_4C,
-            version: 1,
-            entry_count: 42,
-            checksum: 12345,
-        };
+        let mut header = Header::new();
+        header.entry_count = 42;
 
-        // Encode the Header into bytes
-        let encoded: Vec<u8> = header.try_into().expect("Failed to encode Header");
-
-        // Ensure the encoded length matches HEADER_SIZE
+        let encoded = header.encode();
         assert_eq!(encoded.len(), HEADER_SIZE);
 
-        // Decode the bytes back into a Header
-        let decoded = Header::try_from(&encoded[..]).expect("Failed to decode Header");
-
-        // Verify the decoded Header matches the original
+        let decoded = Header::decode(&encoded).expect("Failed to decode Header");
         assert_eq!(header, decoded);
     }
 
     #[test]
-    fn test_header_encoding_error() {
-        // Simulate a write failure by using a writer that errors
-        struct FailingWriter;
+    fn test_header_magic_validation() {
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0..8].copy_from_slice(b"INVALID!");
+        (&mut buf[8..12]).write_u32::<BigEndian>(1).unwrap();
+        (&mut buf[12..20]).write_u64::<BigEndian>(0).unwrap();
 
-        impl Write for FailingWriter {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Write failure",
-                ))
-            }
+        let result = Header::decode(&buf);
+        assert!(matches!(result, Err(Error::InvalidWalMagic)));
+    }
 
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
+    #[test]
+    fn test_header_version_validation() {
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0..8].copy_from_slice(b"ASHDB\x00WL");
+        (&mut buf[8..12]).write_u32::<BigEndian>(999).unwrap();
+        (&mut buf[12..20]).write_u64::<BigEndian>(0).unwrap();
 
-        let header = Header {
-            magic_number: 0x57_41_4C,
-            version: 1,
-            entry_count: 42,
-            checksum: 12345,
-        };
-
-        let mut writer = FailingWriter;
-        let mut encoder = HeaderEncoder::new(&mut writer);
-
-        // Ensure encoding fails
-        let result = encoder.encode(&header);
-        assert!(result.is_err());
+        let result = Header::decode(&buf);
+        assert!(matches!(result, Err(Error::UnsupportedWalVersion(999))));
     }
 
     #[test]
     fn test_header_decoding_invalid_length() {
-        // Provide fewer bytes than required for HEADER_SIZE
-        let invalid_data = vec![0u8; HEADER_SIZE - 2];
-
-        // Attempt decoding and ensure it fails
+        let invalid_data = [0u8; HEADER_SIZE - 2];
         let result = Header::try_from(&invalid_data[..]);
         assert!(result.is_err());
         match result {
-            Err(Error::InvalidHeader) => {} // Expected error
+            Err(Error::InvalidHeader) => {}
             _ => panic!("Expected InvalidHeader error"),
         }
     }
