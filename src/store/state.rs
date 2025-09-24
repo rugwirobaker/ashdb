@@ -87,7 +87,7 @@ impl LsmState {
         }
 
         let levels = self.levels.read().unwrap();
-        levels.get(0).map_or(false, |level| level.table_count() > 4)
+        levels.first().is_some_and(|level| level.table_count() > 4)
     }
 
     /// Increment compaction counter

@@ -48,6 +48,8 @@ impl FlushTask {
 
         // Update manifest (I/O - no locks held)
         {
+            // TODO: investigate a possibe antipattern. Supposed reads should not mutate underlying data.
+            #[allow(clippy::readonly_write_lock)] // next_seq() mutates the header
             let manifest = self.store.state.manifest.write().unwrap();
             let seq = manifest.next_seq();
             manifest.append(VersionEdit::Flush {

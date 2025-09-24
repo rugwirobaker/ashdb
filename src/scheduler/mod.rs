@@ -101,8 +101,11 @@ impl Scheduler {
         // Signal all tasks to stop
         self.shutdown_tx.send(()).ok();
 
+        // Extract tasks and drop the lock before awaiting
+        let tasks: Vec<_> = self.tasks.write().unwrap().drain(..).collect();
+
         // Wait for all tasks to complete
-        for task in self.tasks.write().unwrap().drain(..) {
+        for task in tasks {
             task.await
                 .map_err(|e| crate::Error::InvalidState(format!("Task join error: {}", e)))?;
         }

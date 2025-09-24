@@ -8,24 +8,17 @@ use crate::{
     config::LsmConfig,
     error::Result,
     flock::FileLock,
-    manifest::{edit::VersionEdit, meta::TableMeta, Manifest, ManifestState},
-    memtable::{ActiveMemtable, FrozenMemtable},
+    manifest::{Manifest, ManifestState},
+    memtable::ActiveMemtable,
     scheduler::Scheduler,
     sstable::table::Table,
-    wal::{recovery::recover_memtables, Wal},
+    wal::recovery::recover_memtables,
 };
 
-use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, VecDeque},
-    fs,
-    ops::RangeBounds,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
-        Arc, RwLock,
-    },
-};
+use std::{cmp::Ordering, collections::BinaryHeap, fs, ops::RangeBounds, path::Path, sync::Arc};
+
+/// Type alias for complex iterator used in merge operations
+type KvIterator<'a> = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>;
 
 const LOCK_FILE: &str = "ashdb.lock";
 const MANIFEST_FILE: &str = "manifest.log";
@@ -317,7 +310,7 @@ struct HeapEntry<'a> {
     key: Vec<u8>,
     value: Vec<u8>,
     source: usize,
-    iterator: Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>,
+    iterator: KvIterator<'a>,
 }
 
 impl std::fmt::Debug for HeapEntry<'_> {
@@ -360,7 +353,7 @@ pub struct MergeIterator<'a> {
 }
 
 impl<'a> MergeIterator<'a> {
-    pub fn new(iterators: Vec<Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>>) -> Self {
+    pub fn new(iterators: Vec<KvIterator<'a>>) -> Self {
         let mut heap = BinaryHeap::new();
 
         for (source, mut iterator) in iterators.into_iter().enumerate() {

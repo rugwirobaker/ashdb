@@ -30,6 +30,7 @@ impl Manifest {
         let path = path.into();
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;

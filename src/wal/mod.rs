@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::RwLock;
 
+/// Type alias for WAL entry data (key, optional value)
+type WalEntry = (Vec<u8>, Option<Vec<u8>>);
+
 pub const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -207,7 +210,7 @@ impl ReplayIterator {
 }
 
 impl ReplayIterator {
-    fn read<R: Read>(reader: &mut R) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>> {
+    fn read<R: Read>(reader: &mut R) -> Result<Option<WalEntry>> {
         let record_len = match reader.read_u32::<BigEndian>() {
             Ok(len) => len as usize,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
