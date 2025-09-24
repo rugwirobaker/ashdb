@@ -53,7 +53,7 @@ impl Table {
         }
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self {
             Table::Readable(readable) => readable.get(key),
             Table::Writable(_) => Err(Error::InvalidOperation(
@@ -141,13 +141,14 @@ impl ReadableTable {
         Ok(Self { file, index })
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(entry) = self.index.find(key) {
             let (block_offset, block_size) = (entry.offset, entry.size);
 
             let mut block_data = vec![0u8; block_size as usize];
-            self.file.seek(SeekFrom::Start(block_offset))?;
-            self.file.read_exact(&mut block_data)?;
+            let mut file_reader = self.file.try_clone()?;
+            file_reader.seek(SeekFrom::Start(block_offset))?;
+            file_reader.read_exact(&mut block_data)?;
 
             let block = Block::new(block_data)?;
             return block.get(key);
@@ -237,7 +238,7 @@ impl Iterator for ScanIterator {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::NamedTempFile;
+    use crate::tmpfs::NamedTempFile;
 
     use super::*;
     use crate::sstable::block::Builder;
@@ -282,7 +283,7 @@ mod tests {
         }
 
         // Add the last block if there are any remaining entries
-        if builder.len() > 0 {
+        if !builder.is_empty() {
             let block_data = builder.finish();
             let first_key = first_key_in_block.take().expect("Missing first key");
             table
@@ -294,7 +295,7 @@ mod tests {
         let table = table.finalize().expect("Failed to finalize table");
 
         // Read entries from the table
-        if let Table::Readable(mut readable) = table {
+        if let Table::Readable(readable) = table {
             for (key, value) in entries {
                 let result = readable
                     .get(&key)
@@ -309,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_scan() {
-        use tempfile::NamedTempFile;
+        use crate::tmpfs::NamedTempFile;
 
         // Create a temporary file for the SSTable
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
@@ -354,7 +355,7 @@ mod tests {
         }
 
         // Write the final block if there are remaining entries
-        if builder.len() > 0 {
+        if !builder.is_empty() {
             let block_data = builder.finish();
             let first_key = first_key_in_block
                 .take()
@@ -424,7 +425,7 @@ mod tests {
         let table = table.finalize().expect("Failed to finalize table");
 
         // Test reading a non-existent key
-        if let Table::Readable(mut readable) = table {
+        if let Table::Readable(readable) = table {
             let non_existent_key = b"nonexistent".to_vec();
             let result = readable.get(&non_existent_key).expect("Error during read");
             assert!(result.is_none(), "Non-existent key unexpectedly found");

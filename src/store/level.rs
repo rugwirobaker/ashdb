@@ -72,4 +72,40 @@ impl Level {
         let index = self.sstables.iter().position(|sstable| sstable.id == id);
         index.map(|i| self.sstables.remove(i))
     }
+
+    /// Returns the number of tables in the level.
+    pub fn table_count(&self) -> usize {
+        self.sstables.len()
+    }
+
+    /// Returns all tables in the level (for compaction).
+    pub fn all_tables(&self) -> Vec<crate::manifest::meta::TableMeta> {
+        self.sstables
+            .iter()
+            .map(|sstable| {
+                crate::manifest::meta::TableMeta {
+                    id: sstable.id,
+                    level: self.level_num,
+                    size: sstable.size,
+                    entry_count: 0, // TODO: get from table
+                    min_key: sstable.min_key.clone(),
+                    max_key: sstable.max_key.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Get value for key from this level's SSTables
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // Check each SSTable in the level
+        for sstable in &self.sstables {
+            // Simple range check - could be optimized with bloom filters
+            if key >= sstable.min_key.as_slice() && key <= sstable.max_key.as_slice() {
+                if let Ok(Some(value)) = sstable.table.get(key) {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(None)
+    }
 }

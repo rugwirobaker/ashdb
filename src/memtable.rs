@@ -2,7 +2,7 @@ use crate::error::Result;
 use crate::sstable::{block, table};
 use crate::{wal::Wal, Error};
 use crossbeam_skiplist::{map::Entry, SkipMap};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::{
     ops::{Bound, RangeBounds},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,24 +14,26 @@ pub const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024; // 64MB
 #[derive(Debug)]
 pub struct Memtable {
     data: Arc<SkipMap<Vec<u8>, Option<Vec<u8>>>>,
-    wal: Wal,
+    wal: Arc<RwLock<Wal>>,
+    wal_id: u64,
     size: AtomicUsize,
     frozen: AtomicBool,
 }
 
 impl Memtable {
     /// Creates a new empty Memtable with a new WAL.
-    pub fn new(wal_path: &str) -> Result<Self> {
-        let wal = Wal::new(wal_path)?;
+    pub fn new(wal_path: &str, wal_id: u64) -> Result<Self> {
+        let wal = Arc::new(RwLock::new(Wal::new(wal_path)?));
         Ok(Self {
             data: Arc::new(SkipMap::new()),
-            wal: wal,
+            wal,
+            wal_id,
             size: AtomicUsize::new(0),
             frozen: AtomicBool::new(false),
         })
     }
 
-    pub fn from_wal(wal: Wal) -> Result<Self> {
+    pub fn from_wal(wal: Wal, wal_id: u64) -> Result<Self> {
         let data = Arc::new(SkipMap::new());
         let size = AtomicUsize::new(0);
 
@@ -44,9 +46,11 @@ impl Memtable {
             data.insert(key, value);
         }
 
+        let wal = Arc::new(RwLock::new(wal));
         Ok(Self {
             data,
             wal,
+            wal_id,
             size,
             frozen: AtomicBool::new(false),
         })
@@ -75,7 +79,7 @@ impl Memtable {
         let value_size = value.as_ref().map_or(0, |v| v.len());
         let entry_size = key_size + value_size;
 
-        self.wal.put(&key, value.as_deref())?;
+        self.wal.write().unwrap().append(&key, value.as_deref())?;
         // Insert into the Memtable
         self.data.insert(key, value);
         // Update Memtable size
@@ -106,6 +110,10 @@ impl Memtable {
         self.frozen.load(Ordering::SeqCst)
     }
 
+    pub fn wal_id(&self) -> u64 {
+        self.wal_id
+    }
+
     // Scan range of keys
     pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter> {
         // Extract start and end bounds from the range
@@ -130,7 +138,7 @@ impl Memtable {
 
     // sync synchronizes the Memtable's WAL.
     pub fn sync(&self) -> Result<()> {
-        self.wal.sync()
+        self.wal.write().unwrap().flush()
     }
 }
 
@@ -200,7 +208,7 @@ pub struct ScanIter<'a> {
     inner: SkipMapRange<'a>,
 }
 
-impl<'a> ScanIter<'a> {
+impl ScanIter<'_> {
     /// Maps a SkipMap Entry to the expected output format.
     fn map(entry: Entry<'_, Vec<u8>, Option<Vec<u8>>>) -> <Self as Iterator>::Item {
         let key = entry.key();
@@ -209,7 +217,7 @@ impl<'a> ScanIter<'a> {
     }
 }
 
-impl<'a> Iterator for ScanIter<'a> {
+impl Iterator for ScanIter<'_> {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -217,23 +225,118 @@ impl<'a> Iterator for ScanIter<'a> {
     }
 }
 
+pub struct ActiveMemtable {
+    memtable: Arc<Memtable>,
+    wal: Arc<RwLock<Wal>>,
+    wal_id: u64,
+}
+
+impl ActiveMemtable {
+    pub fn new(wal_path: &str, wal_id: u64) -> Result<Self> {
+        let memtable = Arc::new(Memtable::new(wal_path, wal_id)?);
+        let wal = memtable.wal.clone();
+
+        Ok(Self {
+            memtable,
+            wal,
+            wal_id,
+        })
+    }
+
+    pub fn from_wal(wal: Wal, wal_id: u64) -> Result<Self> {
+        let memtable = Arc::new(Memtable::from_wal(wal, wal_id)?);
+        let wal = memtable.wal.clone();
+
+        Ok(Self {
+            memtable,
+            wal,
+            wal_id,
+        })
+    }
+
+    pub fn freeze(&self) -> Result<FrozenMemtable> {
+        self.memtable.freeze()?;
+
+        Ok(FrozenMemtable {
+            memtable: self.memtable.clone(),
+            wal_id: self.wal_id,
+        })
+    }
+
+    pub fn put(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
+        self.memtable.put(key, value)
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        self.memtable.get(key)
+    }
+
+    pub fn size(&self) -> usize {
+        self.memtable.size()
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.wal.write().unwrap().flush()
+    }
+
+    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter> {
+        self.memtable.scan(range)
+    }
+
+    pub fn memtable(&self) -> &Arc<Memtable> {
+        &self.memtable
+    }
+}
+
+pub struct FrozenMemtable {
+    memtable: Arc<Memtable>,
+    wal_id: u64,
+}
+
+impl FrozenMemtable {
+    pub fn from_wal(wal: Wal, wal_id: u64) -> Result<Self> {
+        let memtable = Arc::new(Memtable::from_wal(wal, wal_id)?);
+        memtable.freeze()?;
+
+        Ok(Self { memtable, wal_id })
+    }
+
+    pub fn wal_id(&self) -> u64 {
+        self.wal_id
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        self.memtable.get(key)
+    }
+
+    pub fn flush(&self, table: &mut table::Table) -> Result<()> {
+        self.memtable.flush(table)
+    }
+
+    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter> {
+        self.memtable.scan(range)
+    }
+
+    pub fn memtable(&self) -> &Arc<Memtable> {
+        &self.memtable
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::tmpfs::TempDir;
 
     fn create_temp_dir() -> TempDir {
         TempDir::new().expect("Failed to create temporary directory")
     }
 
-    // This helper needs updating
     fn create_temp_memtable(temp_dir: &TempDir) -> Memtable {
         let wal_path = temp_dir.path().join("0000.wal");
-        Memtable::new(wal_path.to_str().expect("Failed to create WAL path"))
+        Memtable::new(wal_path.to_str().expect("Failed to create WAL path"), 0)
             .expect("Failed to initialize memtable")
     }
 
-    // This helper also needs updating
     fn create_temp_wal(temp_dir: &TempDir) -> Wal {
         let wal_path = temp_dir.path().join("0000.wal");
         Wal::new(wal_path.to_str().expect("Failed to create WAL path"))
@@ -293,14 +396,16 @@ mod tests {
         let temp_dir = create_temp_dir();
         let wal = create_temp_wal(&temp_dir);
 
-        // Append some key-value pairs
-        wal.put(b"key1", Some(b"value1")).expect("Failed to append");
-        wal.put(b"key2", Some(b"value2")).expect("Failed to append");
-        wal.put(b"key3", None).expect("Failed to append (key only)");
-        wal.sync().expect("Failed to sync");
+        wal.append(b"key1", Some(b"value1"))
+            .expect("Failed to append");
+        wal.append(b"key2", Some(b"value2"))
+            .expect("Failed to append");
+        wal.append(b"key3", None)
+            .expect("Failed to append (key only)");
+        wal.flush().expect("Failed to flush");
 
         // Create a Memtable from the WAL
-        let memtable = Memtable::from_wal(wal).expect("Failed to create Memtable from WAL");
+        let memtable = Memtable::from_wal(wal, 0).expect("Failed to create Memtable from WAL");
 
         // Verify the reconstructed data
         assert_eq!(memtable.get(b"key1"), Some(Some(b"value1".to_vec())));
@@ -382,18 +487,21 @@ mod tests {
         let wal = create_temp_wal(&temp_dir);
 
         // Append some key-value pairs
-        wal.put(b"key1", Some(b"value1")).expect("Failed to append");
-        wal.put(b"key2", Some(b"value2")).expect("Failed to append");
-        wal.put(b"key3", None).expect("Failed to append (key only)");
+        wal.append(b"key1", Some(b"value1"))
+            .expect("Failed to append");
+        wal.append(b"key2", Some(b"value2"))
+            .expect("Failed to append");
+        wal.append(b"key3", None)
+            .expect("Failed to append (key only)");
 
         // Create a Memtable from the WAL
-        let memtable = Memtable::from_wal(wal).expect("Failed to create Memtable from WAL");
+        let memtable = Memtable::from_wal(wal, 0).expect("Failed to create Memtable from WAL");
 
         // Sync the Memtable
         memtable.sync().expect("Failed to sync");
 
         // WAL should contain the same data as the Memtable
-        let wal = memtable.wal.replay().unwrap();
+        let wal = memtable.wal.read().unwrap().replay().unwrap();
         for (i, entry) in wal.enumerate() {
             let (key, value) = entry.unwrap();
             match i {
