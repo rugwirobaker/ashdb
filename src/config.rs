@@ -36,6 +36,14 @@ pub struct SchedulerConfig {
 
     /// Level 0 table count threshold for compaction (default: 4)
     pub level0_compaction_threshold: usize,
+
+    /// Size ratio threshold for tiered compaction (default: 10)
+    /// When the combined size of tables at level N is >= size_ratio * size of level N+1,
+    /// compact level N to level N+1
+    pub size_ratio_threshold: u32,
+
+    /// Maximum number of tables per level in tiered compaction (default: 10)
+    pub max_tables_per_level: usize,
 }
 
 impl Default for LsmConfig {
@@ -58,6 +66,8 @@ impl Default for SchedulerConfig {
             wal_cleanup_interval: Duration::from_secs(30),
             metrics_interval: Duration::from_secs(5),
             level0_compaction_threshold: 4,
+            size_ratio_threshold: 10,
+            max_tables_per_level: 10,
         }
     }
 }
@@ -124,6 +134,18 @@ impl SchedulerConfig {
     /// Set level 0 compaction threshold
     pub fn level0_compaction_threshold(mut self, threshold: usize) -> Self {
         self.level0_compaction_threshold = threshold;
+        self
+    }
+
+    /// Set size ratio threshold for tiered compaction
+    pub fn size_ratio_threshold(mut self, ratio: u32) -> Self {
+        self.size_ratio_threshold = ratio;
+        self
+    }
+
+    /// Set maximum tables per level for tiered compaction
+    pub fn max_tables_per_level(mut self, max_tables: usize) -> Self {
+        self.max_tables_per_level = max_tables;
         self
     }
 }

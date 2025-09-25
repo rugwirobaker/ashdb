@@ -80,14 +80,11 @@ impl LsmState {
         self.flush_pending.store(false, Ordering::SeqCst);
     }
 
-    /// Check if compaction is needed
+    /// Check if compaction is needed - simple version for state coordination
+    /// The actual compaction decision logic is in LsmStore::find_compaction_level()
     pub fn needs_compaction(&self) -> bool {
-        if self.compaction_running.load(Ordering::SeqCst) > 0 {
-            return false;
-        }
-
-        let levels = self.levels.read().unwrap();
-        levels.first().is_some_and(|level| level.table_count() > 4)
+        // Don't run compaction if one is already running
+        self.compaction_running.load(Ordering::SeqCst) == 0
     }
 
     /// Increment compaction counter
