@@ -77,14 +77,8 @@ pub async fn flush_memtable(state: &LsmState, config: &LsmConfig) -> Result<bool
         if levels.is_empty() {
             levels.push(Level::new(0));
         }
-        levels[0].add_sstable(SSTable {
-            id: table_id,
-            table,
-            path: table_path,
-            size: table_meta.size,
-            min_key: table_meta.min_key,
-            max_key: table_meta.max_key,
-        });
+        let sstable = SSTable::new(table_path, table, &table_meta)?;
+        levels[0].add_sstable(sstable)
     }
 
     // Delete WAL file (optional cleanup)
