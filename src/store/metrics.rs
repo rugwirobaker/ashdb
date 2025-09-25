@@ -41,23 +41,35 @@ impl BackgroundTask for MetricsTask {
             .compaction_running
             .load(std::sync::atomic::Ordering::SeqCst);
 
-        let level_counts: Vec<_> = self
+        let (level_counts, level_sizes): (Vec<_>, Vec<_>) = {
+            let levels = self.store.state.levels.read().unwrap();
+            levels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| ((i, l.table_count()), (i, l.size())))
+                .unzip()
+        };
+
+        let next_sstable_id = self
             .store
             .state
-            .levels
-            .read()
-            .unwrap()
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (i, l.table_count()))
-            .collect();
+            .next_sstable_id
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let next_wal_id = self
+            .store
+            .state
+            .next_wal_id
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         tracing::info!(
             active_memtable_size = active_size,
             frozen_memtables = frozen_count,
             flush_pending = flush_pending,
             compaction_running = compaction_running,
+            next_sstable_id = next_sstable_id,
+            next_wal_id = next_wal_id,
             ?level_counts,
+            ?level_sizes,
             "LSM metrics"
         );
 

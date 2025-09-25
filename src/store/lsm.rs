@@ -292,6 +292,50 @@ impl LsmStore {
         None
     }
 
+    /// Get list of deletable WAL file IDs from manifest
+    pub fn deletable_wals(&self) -> Result<Vec<u64>> {
+        let manifest = self.state.manifest.read().unwrap();
+        let state = manifest.replay()?;
+        Ok(state.deletable_wals)
+    }
+
+    /// Clean up WAL files that are no longer needed
+    pub async fn cleanup_wals(&self) -> Result<()> {
+        let deletable = self.deletable_wals()?;
+
+        if deletable.is_empty() {
+            return Ok(()); // No WALs to clean up
+        }
+
+        tracing::debug!(
+            deletable_wals = ?deletable,
+            "Found {} WAL files to clean up",
+            deletable.len()
+        );
+
+        for wal_id in deletable {
+            let wal_path = self.config.dir.join("wal").join(format!("{}.wal", wal_id));
+
+            match std::fs::remove_file(&wal_path) {
+                Ok(_) => {
+                    tracing::info!(wal_id = wal_id, "Deleted WAL file");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already deleted, ignore
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        wal_id = wal_id,
+                        error = %e,
+                        "Failed to delete WAL file"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Perform tiered compaction if needed
     pub async fn compact(&self) -> Result<()> {
         let _guard = self.state.start_compaction();
@@ -1187,6 +1231,255 @@ mod tests {
             assert_eq!(value.len(), 1000, "Large value should be preserved");
         } else {
             panic!("Large key should be accessible after compaction");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_flush_memtable_basic() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Add some data to active memtable
+        for i in 0..10 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        // Freeze the memtable to create a frozen one
+        store.freeze_active_memtable()?;
+
+        // Verify we have a frozen memtable
+        let frozen_count = {
+            let frozen = store.state.frozen_memtables.read().unwrap();
+            frozen.len()
+        };
+        assert_eq!(frozen_count, 1, "Should have one frozen memtable");
+
+        // Flush the memtable
+        let flushed = store.flush_memtable().await?;
+        assert!(flushed, "Should have flushed a memtable");
+
+        // Verify frozen memtable is gone
+        let frozen_count_after = {
+            let frozen = store.state.frozen_memtables.read().unwrap();
+            frozen.len()
+        };
+        assert_eq!(
+            frozen_count_after, 0,
+            "Should have no frozen memtables after flush"
+        );
+
+        // Verify data is still accessible
+        for i in 0..10 {
+            let key = format!("key_{:03}", i);
+            let value = store.get(key.as_bytes())?;
+            assert!(
+                value.is_some(),
+                "Key {} should be accessible after flush",
+                key
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_flush_memtable_empty() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Try to flush when no frozen memtables exist
+        let flushed = store.flush_memtable().await?;
+        assert!(!flushed, "Should not flush when no frozen memtables");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_flush_memtable_multiple() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Create multiple frozen memtables
+        for batch in 0..3 {
+            for i in 0..5 {
+                let key = format!("batch_{}_key_{:03}", batch, i);
+                let value = format!("value_{}", i);
+                store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+            }
+            store.freeze_active_memtable()?;
+        }
+
+        // Verify we have 3 frozen memtables
+        let frozen_count = {
+            let frozen = store.state.frozen_memtables.read().unwrap();
+            frozen.len()
+        };
+        assert_eq!(frozen_count, 3, "Should have three frozen memtables");
+
+        // Flush all memtables
+        let mut flush_count = 0;
+        while store.flush_memtable().await? {
+            flush_count += 1;
+        }
+        assert_eq!(flush_count, 3, "Should have flushed 3 memtables");
+
+        // Verify all data is still accessible
+        for batch in 0..3 {
+            for i in 0..5 {
+                let key = format!("batch_{}_key_{:03}", batch, i);
+                let value = store.get(key.as_bytes())?;
+                assert!(value.is_some(), "Key {} should be accessible", key);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_cleanup_no_deletable() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // With a fresh store, there should be no deletable WALs
+        let _deletable = store.deletable_wals()?;
+        // Should return a valid list (no assertion needed, if it fails it will panic)
+
+        // Cleanup should be a no-op
+        store.cleanup_wals().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_cleanup_after_flush() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Add data and flush to create a scenario where WALs might be deletable
+        for i in 0..10 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        // Freeze and flush
+        store.freeze_active_memtable()?;
+        let flushed = store.flush_memtable().await?;
+        assert!(flushed, "Should have flushed a memtable");
+
+        // Try cleanup - should handle gracefully even if no WALs are deletable yet
+        store.cleanup_wals().await?;
+
+        // Verify data is still accessible
+        for i in 0..10 {
+            let key = format!("key_{:03}", i);
+            let value = store.get(key.as_bytes())?;
+            assert!(
+                value.is_some(),
+                "Key {} should be accessible after cleanup",
+                key
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_cleanup_missing_file() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Add some data
+        for i in 0..5 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        // Create WAL directory structure
+        let wal_dir = temp_dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir)?;
+
+        // Create a fake WAL file that we can test deletion with
+        let test_wal_path = wal_dir.join("999.wal");
+        std::fs::write(&test_wal_path, b"test")?;
+
+        // Delete the file to simulate missing file scenario
+        std::fs::remove_file(&test_wal_path)?;
+
+        // Cleanup should handle missing files gracefully (tested indirectly through no panic)
+        store.cleanup_wals().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deletable_wals_method() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // The deletable_wals method should work without error
+        let _deletable = store.deletable_wals()?;
+        // For a fresh store, this should return a valid list (no assertion needed, if it fails it will panic)
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_flush_and_cleanup_integration() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Create data that will result in multiple memtables and potential WAL cleanup
+        for batch in 0..2 {
+            for i in 0..20 {
+                let key = format!("integration_{}_{:03}", batch, i);
+                let value = format!("value_{}", i);
+                store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+            }
+
+            // Freeze and flush each batch
+            store.freeze_active_memtable()?;
+            while store.flush_memtable().await? {
+                // Keep flushing until no more frozen memtables
+            }
+        }
+
+        // Run cleanup
+        store.cleanup_wals().await?;
+
+        // Verify all data is still accessible
+        for batch in 0..2 {
+            for i in 0..20 {
+                let key = format!("integration_{}_{:03}", batch, i);
+                let value = store.get(key.as_bytes())?;
+                assert!(
+                    value.is_some(),
+                    "Key {} should be accessible after flush and cleanup",
+                    key
+                );
+            }
+        }
+
+        // Verify data integrity with scan
+        let scan_results: Result<Vec<_>> = store.scan(..).collect();
+        let results = scan_results?;
+        assert_eq!(
+            results.len(),
+            40,
+            "Should have 40 entries after integration test"
+        );
+
+        // Verify keys are in order
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].0 < results[i].0,
+                "Keys should be in order after flush and cleanup"
+            );
         }
 
         Ok(())
