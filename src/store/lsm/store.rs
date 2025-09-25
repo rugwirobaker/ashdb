@@ -1,26 +1,16 @@
 use super::{
-    level::{Level, SSTable},
-    state::LsmState,
-    Store,
-};
-
-use crate::{
-    config::LsmConfig,
-    error::Result,
-    flock::FileLock,
-    manifest::{Manifest, ManifestState},
+    super::Store,
+    compaction, flush,
+    iterator::{MergeIterator, OwningMemtableIter},
     memtable::ActiveMemtable,
-    sstable::table::Table,
-    wal::recovery::recover_memtables,
+    metrics, recovery, wal_cleanup, LsmState,
 };
 
-use std::{cmp::Ordering, collections::BinaryHeap, fs, ops::RangeBounds, path::Path, sync::Arc};
+use crate::{config::LsmConfig, error::Result, flock::FileLock};
 
-/// Type alias for complex iterator used in merge operations
-type KvIterator<'a> = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>;
+use std::{fs, ops::RangeBounds, sync::Arc};
 
 const LOCK_FILE: &str = "ashdb.lock";
-const MANIFEST_FILE: &str = "manifest.log";
 
 /// LSM Store with interior mutability
 pub struct LsmStore {
@@ -47,7 +37,7 @@ impl LsmStore {
         let lock = FileLock::lock(config.dir.join(LOCK_FILE))?;
 
         // Initialize/recover state
-        let state = Arc::new(Self::recover_state(&config)?);
+        let state = Arc::new(recovery::recover_state(&config)?);
 
         // Create store instance (no scheduler, no background tasks)
         Ok(Self {
@@ -55,57 +45,6 @@ impl LsmStore {
             lock: Some(lock),
             state,
         })
-    }
-
-    /// Recover state from manifest and WAL files
-    pub(crate) fn recover_state(config: &LsmConfig) -> Result<LsmState> {
-        let dir = &config.dir;
-
-        // Open or create manifest
-        let manifest_path = dir.join(MANIFEST_FILE);
-        let manifest = Manifest::new(&manifest_path)?;
-
-        // Recover levels from manifest
-        let manifest_state = manifest.replay()?;
-        let levels = Self::levels_from_manifest_state(dir, &manifest_state)?;
-
-        // Recover memtables from WAL
-        let (active_memtable, frozen_memtables, next_wal_id) = recover_memtables(dir)?;
-
-        Ok(LsmState::new(
-            active_memtable,
-            frozen_memtables,
-            levels,
-            manifest,
-            manifest_state.next_table_id,
-            next_wal_id,
-        ))
-    }
-
-    /// Convert manifest state to levels
-    fn levels_from_manifest_state(dir: &Path, state: &ManifestState) -> Result<Vec<Level>> {
-        let mut levels = Vec::new();
-
-        for level_meta in &state.levels {
-            while levels.len() <= level_meta.level as usize {
-                levels.push(Level::new(levels.len() as u32));
-            }
-
-            for table_meta in &level_meta.tables {
-                let path = dir.join(format!("{}.sst", table_meta.id));
-                let table = Table::readable(path.to_str().unwrap())?;
-                levels[level_meta.level as usize].add_sstable(SSTable {
-                    id: table_meta.id,
-                    table,
-                    path,
-                    size: table_meta.size,
-                    min_key: table_meta.min_key.clone(),
-                    max_key: table_meta.max_key.clone(),
-                });
-            }
-        }
-
-        Ok(levels)
     }
 
     /// Freeze active memtable (atomic operation)
@@ -143,390 +82,47 @@ impl LsmStore {
 
     /// Check if compaction is needed
     pub fn needs_compaction(&self) -> bool {
-        // Don't run if already running
-        if !self.state.needs_compaction() {
-            return false;
-        }
-
-        // Use the actual compaction decision logic
-        self.find_compaction_level().is_some()
+        compaction::needs_compaction(&self.state, &self.config.compaction)
     }
 
     /// Manually flush oldest frozen memtable to SSTable (for testing)
     pub async fn flush_memtable(&self) -> Result<bool> {
-        // Get oldest frozen memtable
-        let memtable = {
-            let mut frozen = self.state.frozen_memtables.write().unwrap();
-            match frozen.pop_front() {
-                Some(m) => m,
-                None => return Ok(false), // Nothing to flush
-            }
-        };
-
-        let wal_id = memtable.wal_id();
-
-        // Create SSTable (I/O - no locks held)
-        let table_id = self.state.next_sstable_id();
-        let table_path = self.config.dir.join(format!("{}.sst", table_id));
-        let mut sstable = crate::sstable::table::Table::writable(table_path.to_str().unwrap())?;
-
-        // Extract metadata during flush
-        let (min_key, max_key, entry_count) = {
-            let mut scan_iter = memtable.scan(..)?;
-            let mut min_key: Option<Vec<u8>> = None;
-            let mut max_key: Option<Vec<u8>> = None;
-            let mut count = 0;
-
-            if let Some(Ok((key, _))) = scan_iter.next() {
-                min_key = Some(key.clone());
-                max_key = Some(key);
-                count = 1;
-
-                // Continue iterating to get max key and count
-                for entry_result in scan_iter {
-                    let (key, _) = entry_result?;
-                    max_key = Some(key);
-                    count += 1;
-                }
-            }
-
-            (
-                min_key.unwrap_or_default(),
-                max_key.unwrap_or_default(),
-                count,
-            )
-        };
-
-        memtable.flush(&mut sstable)?;
-        let table = sstable.finalize()?;
-
-        let table_meta = crate::manifest::meta::TableMeta {
-            id: table_id,
-            level: 0,
-            size: std::fs::metadata(&table_path)?.len(),
-            entry_count,
-            min_key,
-            max_key,
-        };
-
-        // Update manifest (I/O - no locks held)
-        {
-            #[allow(clippy::readonly_write_lock)] // next_seq() mutates the header
-            let manifest = self.state.manifest.write().unwrap();
-            let seq = manifest.next_seq();
-            manifest.append(crate::manifest::edit::VersionEdit::Flush {
-                seq,
-                table: table_meta.clone(),
-                wal_id,
-            })?;
-            manifest.sync()?;
-        }
-
-        // Add to level 0
-        {
-            let mut levels = self.state.levels.write().unwrap();
-            if levels.is_empty() {
-                levels.push(crate::store::level::Level::new(0));
-            }
-            levels[0].add_sstable(crate::store::level::SSTable {
-                id: table_id,
-                table,
-                path: table_path,
-                size: table_meta.size,
-                min_key: table_meta.min_key,
-                max_key: table_meta.max_key,
-            });
-        }
-
-        // Delete WAL file (optional cleanup)
-        let wal_path = self.config.dir.join("wal").join(format!("{}.wal", wal_id));
-        if let Err(e) = std::fs::remove_file(&wal_path) {
-            tracing::warn!(wal_id = wal_id, error = %e, "Failed to delete WAL file");
-        }
-
-        tracing::info!(
-            table_id = table_id,
-            wal_id = wal_id,
-            "Manually flushed memtable to SSTable"
-        );
-
-        Ok(true)
-    }
-
-    /// Check which level needs compaction in tiered strategy
-    fn find_compaction_level(&self) -> Option<u32> {
-        let levels = self.state.levels.read().unwrap();
-
-        // First priority: L0 compaction
-        if !levels.is_empty()
-            && levels[0].table_count() > self.config.scheduler.level0_compaction_threshold
-        {
-            return Some(0);
-        }
-
-        // Check higher levels for size-ratio based compaction
-        for level_num in 1..levels.len() {
-            let current_level = &levels[level_num];
-
-            // Skip if level has fewer than max_tables_per_level tables
-            if current_level.table_count() < self.config.scheduler.max_tables_per_level {
-                continue;
-            }
-
-            // Check size ratio against next level
-            if level_num + 1 < levels.len() {
-                let next_level = &levels[level_num + 1];
-                let current_size = current_level.size();
-                let next_size = next_level.size().max(1); // Avoid division by zero
-                let size_ratio = current_size / next_size;
-
-                if size_ratio >= self.config.scheduler.size_ratio_threshold as u64 {
-                    return Some(level_num as u32);
-                }
-            } else {
-                // If next level doesn't exist, compact when we have too many tables
-                return Some(level_num as u32);
-            }
-        }
-
-        None
+        flush::flush_memtable(&self.state, &self.config).await
     }
 
     /// Get list of deletable WAL file IDs from manifest
     pub fn deletable_wals(&self) -> Result<Vec<u64>> {
-        let manifest = self.state.manifest.read().unwrap();
-        let state = manifest.replay()?;
-        Ok(state.deletable_wals)
+        wal_cleanup::deletable_wals(&self.state)
     }
 
     /// Clean up WAL files that are no longer needed
     pub async fn cleanup_wals(&self) -> Result<()> {
-        let deletable = self.deletable_wals()?;
-
-        if deletable.is_empty() {
-            return Ok(()); // No WALs to clean up
-        }
-
-        tracing::debug!(
-            deletable_wals = ?deletable,
-            "Found {} WAL files to clean up",
-            deletable.len()
-        );
-
-        for wal_id in deletable {
-            let wal_path = self.config.dir.join("wal").join(format!("{}.wal", wal_id));
-
-            match std::fs::remove_file(&wal_path) {
-                Ok(_) => {
-                    tracing::info!(wal_id = wal_id, "Deleted WAL file");
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Already deleted, ignore
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        wal_id = wal_id,
-                        error = %e,
-                        "Failed to delete WAL file"
-                    );
-                }
-            }
-        }
-
-        Ok(())
+        wal_cleanup::cleanup_wals(&self.state, &self.config).await
     }
 
     /// Perform tiered compaction if needed
     pub async fn compact(&self) -> Result<()> {
-        let _guard = self.state.start_compaction();
+        compaction::compact(&self.state, &self.config).await
+    }
 
-        // Find which level needs compaction
-        let source_level = match self.find_compaction_level() {
-            Some(level) => level,
-            None => return Ok(()), // No compaction needed
-        };
+    /// Collect and log metrics
+    pub fn collect_metrics(&self) -> Result<()> {
+        metrics::collect_metrics(&self.state)
+    }
 
-        let target_level = source_level + 1;
+    /// Check if flush is needed
+    pub fn needs_flush(&self) -> bool {
+        self.state.needs_flush()
+    }
 
-        // Get source tables to compact
-        let source_tables = {
-            let levels = self.state.levels.read().unwrap();
-            if (source_level as usize) >= levels.len() {
-                return Ok(());
-            }
-            levels[source_level as usize].all_tables()
-        };
+    /// Try to mark flush as pending (returns true if successfully marked)
+    pub fn try_mark_flush_pending(&self) -> bool {
+        self.state.try_mark_flush_pending()
+    }
 
-        tracing::info!(
-            source_level = source_level,
-            target_level = target_level,
-            source_tables = source_tables.len(),
-            "Starting tiered compaction"
-        );
-
-        // 1. Create iterators for all source tables
-        let mut iterators = Vec::new();
-        let source_table_ids: Vec<u64> = source_tables.iter().map(|t| t.id).collect();
-
-        {
-            let levels = self.state.levels.read().unwrap();
-            for table_meta in &source_tables {
-                let sstable = levels[source_level as usize]
-                    .sstables
-                    .iter()
-                    .find(|s| s.id == table_meta.id)
-                    .ok_or_else(|| {
-                        crate::Error::InvalidOperation("SSTable not found".to_string())
-                    })?;
-
-                let scan_iter = sstable.table.scan(..)?;
-                let boxed_iter: KvIterator = Box::new(scan_iter);
-                iterators.push(boxed_iter);
-            }
-        }
-
-        // 2. Create merge iterator and write to new SSTable
-        let merge_iter = MergeIterator::new(iterators);
-
-        let table_id = self.state.next_sstable_id();
-        let table_path = self.config.dir.join(format!("{}.sst", table_id));
-        let mut writable_table =
-            crate::sstable::table::Table::writable(table_path.to_str().unwrap())?;
-
-        let mut builder = crate::sstable::block::Builder::new();
-        let mut first_key_in_block: Option<Vec<u8>> = None;
-        let mut entry_count = 0;
-        let mut min_key: Option<Vec<u8>> = None;
-        let mut max_key: Option<Vec<u8>> = None;
-
-        for entry_result in merge_iter {
-            let (key, value) = entry_result?;
-
-            // Track min/max keys
-            if min_key.is_none() {
-                min_key = Some(key.clone());
-            }
-            max_key = Some(key.clone());
-
-            if first_key_in_block.is_none() {
-                first_key_in_block = Some(key.clone());
-            }
-
-            builder.add_entry(&key, &value);
-            entry_count += 1;
-
-            // Flush block when it gets large enough
-            if builder.len() >= crate::sstable::table::MAX_BLOCK_SIZE {
-                let block_data = builder.finish();
-                let first_key = first_key_in_block.take().unwrap();
-                writable_table.add_block(&block_data, first_key)?;
-                builder = crate::sstable::block::Builder::new();
-            }
-        }
-
-        // Write final block if not empty
-        if !builder.is_empty() {
-            let block_data = builder.finish();
-            let first_key = first_key_in_block.take().unwrap();
-            writable_table.add_block(&block_data, first_key)?;
-        }
-
-        let finalized_table = writable_table.finalize()?;
-
-        // 3. Create table metadata
-        let table_meta = crate::manifest::meta::TableMeta {
-            id: table_id,
-            level: target_level,
-            size: std::fs::metadata(&table_path)?.len(),
-            entry_count,
-            min_key: min_key.unwrap_or_default(),
-            max_key: max_key.unwrap_or_default(),
-        };
-
-        // 4. Update manifest with compaction record
-        let job_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-
-        {
-            #[allow(clippy::readonly_write_lock)] // next_seq() mutates the manifest
-            let manifest = self.state.manifest.write().unwrap();
-            let begin_seq = manifest.next_seq();
-            manifest.append(crate::manifest::edit::VersionEdit::BeginCompaction {
-                seq: begin_seq,
-                job_id,
-                source_level,
-                target_level,
-            })?;
-
-            let commit_seq = manifest.next_seq();
-            manifest.append(crate::manifest::edit::VersionEdit::CommitCompaction {
-                seq: commit_seq,
-                job_id,
-                source_level,
-                deleted_tables: source_table_ids.clone(),
-                target_level,
-                added_tables: vec![table_meta.clone()],
-            })?;
-            manifest.sync()?;
-        }
-
-        // 5. Update levels data structure
-        {
-            let mut levels = self.state.levels.write().unwrap();
-
-            // Remove source tables from source level
-            if (source_level as usize) < levels.len() {
-                levels[source_level as usize]
-                    .sstables
-                    .retain(|t| !source_table_ids.contains(&t.id));
-            }
-
-            // Ensure target level exists
-            while levels.len() <= target_level as usize {
-                let level_num = levels.len() as u32;
-                levels.push(crate::store::level::Level::new(level_num));
-            }
-
-            // Add new table to target level
-            let readable_table = match finalized_table {
-                crate::sstable::table::Table::Readable(r) => r,
-                _ => {
-                    return Err(crate::Error::InvalidOperation(
-                        "Expected readable table".to_string(),
-                    ))
-                }
-            };
-
-            levels[target_level as usize].add_sstable(crate::store::level::SSTable {
-                id: table_id,
-                table: crate::sstable::table::Table::Readable(readable_table),
-                path: table_path,
-                size: table_meta.size,
-                min_key: table_meta.min_key.clone(),
-                max_key: table_meta.max_key.clone(),
-            });
-        }
-
-        // 6. Delete old SSTable files
-        for table_id in &source_table_ids {
-            let old_path = self.config.dir.join(format!("{}.sst", table_id));
-            if let Err(e) = std::fs::remove_file(&old_path) {
-                tracing::warn!(table_id = table_id, error = %e, "Failed to delete old SSTable file");
-            }
-        }
-
-        tracing::info!(
-            source_level = source_level,
-            target_level = target_level,
-            source_tables = source_table_ids.len(),
-            target_table = table_id,
-            entries_compacted = entry_count,
-            "Completed tiered compaction"
-        );
-
-        Ok(())
+    /// Mark flush as completed
+    pub fn mark_flush_completed(&self) {
+        self.state.mark_flush_completed()
     }
 }
 
@@ -599,7 +195,7 @@ impl Store for LsmStore {
             Arc::clone(active.memtable())
         };
 
-        let frozen_arcs: Vec<Arc<crate::memtable::Memtable>> = {
+        let frozen_arcs: Vec<Arc<super::memtable::Memtable>> = {
             let frozen = self.state.frozen_memtables.read().unwrap();
             frozen
                 .iter()
@@ -642,161 +238,30 @@ impl Store for LsmStore {
     }
 }
 
-// Iterator implementations (same as original)
-struct OwningMemtableIter {
-    _memtable: Arc<crate::memtable::Memtable>,
-    iter: crate::memtable::ScanIter<'static>,
-}
-
-impl OwningMemtableIter {
-    fn new(memtable: Arc<crate::memtable::Memtable>, range: impl RangeBounds<Vec<u8>>) -> Self {
-        let iter = unsafe {
-            std::mem::transmute::<crate::memtable::ScanIter<'_>, crate::memtable::ScanIter<'static>>(
-                memtable.scan(range).unwrap(),
-            )
-        };
-
-        Self {
-            _memtable: memtable,
-            iter,
-        }
-    }
-}
-
-impl Iterator for OwningMemtableIter {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next()
-    }
-}
-
-struct HeapEntry<'a> {
-    key: Vec<u8>,
-    value: Vec<u8>,
-    source: usize,
-    iterator: KvIterator<'a>,
-}
-
-impl std::fmt::Debug for HeapEntry<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HeapEntry")
-            .field("key", &self.key)
-            .field("value", &self.value)
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
-impl PartialEq for HeapEntry<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Eq for HeapEntry<'_> {}
-
-impl PartialOrd for HeapEntry<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HeapEntry<'_> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match self.key.cmp(&other.key) {
-            Ordering::Equal => other.source.cmp(&self.source),
-            other => other.reverse(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct MergeIterator<'a> {
-    heap: BinaryHeap<HeapEntry<'a>>,
-    latest_key: Option<Vec<u8>>,
-}
-
-impl<'a> MergeIterator<'a> {
-    pub fn new(iterators: Vec<KvIterator<'a>>) -> Self {
-        let mut heap = BinaryHeap::new();
-
-        for (source, mut iterator) in iterators.into_iter().enumerate() {
-            if let Some(Ok((key, value))) = iterator.next() {
-                heap.push(HeapEntry {
-                    key,
-                    value,
-                    source,
-                    iterator,
-                });
-            }
-        }
-
-        Self {
-            heap,
-            latest_key: None,
-        }
-    }
-}
-
-impl Iterator for MergeIterator<'_> {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(mut entry) = self.heap.pop() {
-            if self.latest_key.as_ref() == Some(&entry.key) {
-                if let Some(Ok((key, value))) = entry.iterator.next() {
-                    self.heap.push(HeapEntry {
-                        key,
-                        value,
-                        source: entry.source,
-                        iterator: entry.iterator,
-                    });
-                }
-                continue;
-            }
-
-            self.latest_key = Some(entry.key.clone());
-
-            if let Some(Ok((key, value))) = entry.iterator.next() {
-                self.heap.push(HeapEntry {
-                    key,
-                    value,
-                    source: entry.source,
-                    iterator: entry.iterator,
-                });
-            }
-            return Some(Ok((entry.key, entry.value)));
-        }
-
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        config::{LsmConfig, SchedulerConfig},
+        config::{CompactionConfig, LsmConfig},
         store::Store,
         tmpfs::TempDir,
     };
     use std::time::Duration;
 
     // Helper function to create a test store with custom config
-    fn create_test_store_with_config(temp_dir: &TempDir, config: SchedulerConfig) -> LsmStore {
-        let lsm_config = LsmConfig::new(temp_dir.path()).scheduler(config);
+    fn create_test_store_with_config(temp_dir: &TempDir, config: CompactionConfig) -> LsmStore {
+        let lsm_config = LsmConfig::new(temp_dir.path()).compaction(config);
         LsmStore::open_with_config(lsm_config).expect("Failed to create store")
     }
 
     // Helper function to create a test store with default aggressive compaction settings
     fn create_test_store(temp_dir: &TempDir) -> LsmStore {
-        let scheduler_config = SchedulerConfig::default()
+        let compaction_config = CompactionConfig::default()
             .level0_compaction_threshold(2) // Lower threshold for easier testing
             .size_ratio_threshold(2) // Lower ratio for easier testing
             .max_tables_per_level(3); // Lower max for easier testing
 
-        create_test_store_with_config(temp_dir, scheduler_config)
+        create_test_store_with_config(temp_dir, compaction_config)
     }
 
     // Helper to populate data that will create multiple SSTables
@@ -884,7 +349,7 @@ mod tests {
 
             // L0 should be empty or have fewer tables
             assert!(
-                levels[0].table_count() <= store.config.scheduler.level0_compaction_threshold,
+                levels[0].table_count() <= store.config.compaction.level0_compaction_threshold,
                 "L0 should have <= threshold tables after compaction"
             );
 
@@ -980,7 +445,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
         // Test with very aggressive settings
-        let aggressive_config = SchedulerConfig::default()
+        let aggressive_config = CompactionConfig::default()
             .level0_compaction_threshold(1)
             .size_ratio_threshold(1)
             .max_tables_per_level(1);

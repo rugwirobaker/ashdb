@@ -18,6 +18,9 @@ pub struct LsmConfig {
 
     /// Scheduler configuration
     pub scheduler: SchedulerConfig,
+
+    /// Compaction configuration
+    pub compaction: CompactionConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +36,10 @@ pub struct SchedulerConfig {
 
     /// How often to collect metrics (default: 5s)
     pub metrics_interval: Duration,
+}
 
+#[derive(Debug, Clone)]
+pub struct CompactionConfig {
     /// Level 0 table count threshold for compaction (default: 4)
     pub level0_compaction_threshold: usize,
 
@@ -46,6 +52,16 @@ pub struct SchedulerConfig {
     pub max_tables_per_level: usize,
 }
 
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            level0_compaction_threshold: 4,
+            size_ratio_threshold: 10,
+            max_tables_per_level: 10,
+        }
+    }
+}
+
 impl Default for LsmConfig {
     fn default() -> Self {
         Self {
@@ -54,6 +70,7 @@ impl Default for LsmConfig {
             wal_direct_io: false,
             wal_buffer_size: 64 * 1024, // 64KB
             scheduler: SchedulerConfig::default(),
+            compaction: CompactionConfig::default(),
         }
     }
 }
@@ -65,9 +82,6 @@ impl Default for SchedulerConfig {
             compaction_interval: Duration::from_secs(10),
             wal_cleanup_interval: Duration::from_secs(30),
             metrics_interval: Duration::from_secs(5),
-            level0_compaction_threshold: 4,
-            size_ratio_threshold: 10,
-            max_tables_per_level: 10,
         }
     }
 }
@@ -104,6 +118,12 @@ impl LsmConfig {
         self.scheduler = config;
         self
     }
+
+    /// Configure compaction settings
+    pub fn compaction(mut self, config: CompactionConfig) -> Self {
+        self.compaction = config;
+        self
+    }
 }
 
 impl SchedulerConfig {
@@ -130,7 +150,9 @@ impl SchedulerConfig {
         self.metrics_interval = interval;
         self
     }
+}
 
+impl CompactionConfig {
     /// Set level 0 compaction threshold
     pub fn level0_compaction_threshold(mut self, threshold: usize) -> Self {
         self.level0_compaction_threshold = threshold;
@@ -161,6 +183,11 @@ mod tests {
         assert_eq!(config.max_memtable_size, 64 * 1024 * 1024);
         assert!(!config.wal_direct_io);
         assert_eq!(config.wal_buffer_size, 64 * 1024);
+
+        // Test default compaction config
+        assert_eq!(config.compaction.level0_compaction_threshold, 4);
+        assert_eq!(config.compaction.size_ratio_threshold, 10);
+        assert_eq!(config.compaction.max_tables_per_level, 10);
     }
 
     #[test]
@@ -172,12 +199,25 @@ mod tests {
                 SchedulerConfig::default()
                     .flush_interval(Duration::from_millis(500))
                     .compaction_interval(Duration::from_secs(5)),
+            )
+            .compaction(
+                CompactionConfig::default()
+                    .level0_compaction_threshold(2)
+                    .size_ratio_threshold(5)
+                    .max_tables_per_level(8),
             );
 
         assert_eq!(config.dir, PathBuf::from("/tmp/test"));
         assert_eq!(config.max_memtable_size, 32 * 1024 * 1024);
         assert!(config.wal_direct_io);
+
+        // Test scheduler config
         assert_eq!(config.scheduler.flush_interval, Duration::from_millis(500));
         assert_eq!(config.scheduler.compaction_interval, Duration::from_secs(5));
+
+        // Test compaction config
+        assert_eq!(config.compaction.level0_compaction_threshold, 2);
+        assert_eq!(config.compaction.size_ratio_threshold, 5);
+        assert_eq!(config.compaction.max_tables_per_level, 8);
     }
 }

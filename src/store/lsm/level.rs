@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
+use super::sstable::table::{self, Table};
 use crate::error::Result;
-use crate::sstable::table::{self, Table};
 
 pub struct SSTable {
     pub id: u64,
@@ -79,11 +79,11 @@ impl Level {
     }
 
     /// Returns all tables in the level (for compaction).
-    pub fn all_tables(&self) -> Vec<crate::manifest::meta::TableMeta> {
+    pub fn all_tables(&self) -> Vec<super::manifest::meta::TableMeta> {
         self.sstables
             .iter()
             .map(|sstable| {
-                crate::manifest::meta::TableMeta {
+                super::manifest::meta::TableMeta {
                     id: sstable.id,
                     level: self.level_num,
                     size: sstable.size,

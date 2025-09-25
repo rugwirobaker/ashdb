@@ -1,15 +1,13 @@
+use super::super::sstable::{block, table};
+use super::super::wal::Wal;
 use crate::error::Result;
-use crate::sstable::{block, table};
-use crate::{wal::Wal, Error};
+use crate::Error;
 use crossbeam_skiplist::{map::Entry, SkipMap};
 use std::sync::{Arc, RwLock};
 use std::{
     ops::{Bound, RangeBounds},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-
-// MAX_MEMTABLE_SIZE is the maximum size of the Memtable in bytes.
-pub const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024; // 64MB
 
 #[derive(Debug)]
 pub struct Memtable {
@@ -55,21 +53,7 @@ impl Memtable {
             frozen: AtomicBool::new(false),
         })
     }
-}
 
-// impl Clone for Memtable {
-//     fn clone(&self) -> Self {
-//         Memtable {
-//             // Copy the ID directly
-//             data: self.data.clone(), // Clone the Arc for the SkipMap
-//             wal: &self.wal.clone(),  // Clone the Arc for the WAL
-//             size: AtomicUsize::new(self.size.load(Ordering::SeqCst)), // Initialize a new AtomicUsize with the current size
-//             is_frozen: AtomicBool::new(self.is_frozen.load(Ordering::SeqCst)), // Initialize a new AtomicBool with the current frozen state
-//         }
-//     }
-// }
-
-impl Memtable {
     /// Inserts or updates a key-value pair in the Memtable.
     pub fn put(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
         if self.frozen.load(Ordering::SeqCst) {
@@ -114,6 +98,10 @@ impl Memtable {
         self.wal_id
     }
 
+    pub fn wal(&self) -> &Arc<RwLock<Wal>> {
+        &self.wal
+    }
+
     // Scan range of keys
     pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter> {
         // Extract start and end bounds from the range
@@ -140,9 +128,7 @@ impl Memtable {
     pub fn sync(&self) -> Result<()> {
         self.wal.write().unwrap().flush()
     }
-}
 
-impl Memtable {
     pub fn flush(&self, table: &mut table::Table) -> Result<()> {
         let mut builder = block::Builder::new();
         let mut first_key_in_block: Option<Vec<u8>> = None;
@@ -222,103 +208,6 @@ impl Iterator for ScanIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(Self::map)
-    }
-}
-
-pub struct ActiveMemtable {
-    memtable: Arc<Memtable>,
-    wal: Arc<RwLock<Wal>>,
-    wal_id: u64,
-}
-
-impl ActiveMemtable {
-    pub fn new(wal_path: &str, wal_id: u64) -> Result<Self> {
-        let memtable = Arc::new(Memtable::new(wal_path, wal_id)?);
-        let wal = memtable.wal.clone();
-
-        Ok(Self {
-            memtable,
-            wal,
-            wal_id,
-        })
-    }
-
-    pub fn from_wal(wal: Wal, wal_id: u64) -> Result<Self> {
-        let memtable = Arc::new(Memtable::from_wal(wal, wal_id)?);
-        let wal = memtable.wal.clone();
-
-        Ok(Self {
-            memtable,
-            wal,
-            wal_id,
-        })
-    }
-
-    pub fn freeze(&self) -> Result<FrozenMemtable> {
-        self.memtable.freeze()?;
-
-        Ok(FrozenMemtable {
-            memtable: self.memtable.clone(),
-            wal_id: self.wal_id,
-        })
-    }
-
-    pub fn put(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
-        self.memtable.put(key, value)
-    }
-
-    pub fn get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        self.memtable.get(key)
-    }
-
-    pub fn size(&self) -> usize {
-        self.memtable.size()
-    }
-
-    pub fn sync(&self) -> Result<()> {
-        self.wal.write().unwrap().flush()
-    }
-
-    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter> {
-        self.memtable.scan(range)
-    }
-
-    pub fn memtable(&self) -> &Arc<Memtable> {
-        &self.memtable
-    }
-}
-
-pub struct FrozenMemtable {
-    memtable: Arc<Memtable>,
-    wal_id: u64,
-}
-
-impl FrozenMemtable {
-    pub fn from_wal(wal: Wal, wal_id: u64) -> Result<Self> {
-        let memtable = Arc::new(Memtable::from_wal(wal, wal_id)?);
-        memtable.freeze()?;
-
-        Ok(Self { memtable, wal_id })
-    }
-
-    pub fn wal_id(&self) -> u64 {
-        self.wal_id
-    }
-
-    pub fn get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        self.memtable.get(key)
-    }
-
-    pub fn flush(&self, table: &mut table::Table) -> Result<()> {
-        self.memtable.flush(table)
-    }
-
-    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter> {
-        self.memtable.scan(range)
-    }
-
-    pub fn memtable(&self) -> &Arc<Memtable> {
-        &self.memtable
     }
 }
 

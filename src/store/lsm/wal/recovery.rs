@@ -1,10 +1,10 @@
 use std::{collections::VecDeque, path::Path};
 
-use crate::{
-    error::Result,
-    memtable::{ActiveMemtable, FrozenMemtable},
-    wal::Wal,
+use super::{
+    super::memtable::{ActiveMemtable, FrozenMemtable},
+    Wal,
 };
+use crate::error::Result;
 
 pub type MemtableRecovery = (ActiveMemtable, VecDeque<FrozenMemtable>, u64);
 
