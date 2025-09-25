@@ -34,6 +34,33 @@ impl FlushTask {
         let table_path = self.store.config.dir.join(format!("{}.sst", table_id));
         let mut sstable = Table::writable(table_path.to_str().unwrap())?;
 
+        // Extract metadata during flush
+        let (min_key, max_key, entry_count) = {
+            let mut scan_iter = memtable.scan(..)?;
+            let mut min_key: Option<Vec<u8>> = None;
+            let mut max_key: Option<Vec<u8>> = None;
+            let mut count = 0;
+
+            if let Some(Ok((key, _))) = scan_iter.next() {
+                min_key = Some(key.clone());
+                max_key = Some(key);
+                count = 1;
+
+                // Continue iterating to get max key and count
+                for entry_result in scan_iter {
+                    let (key, _) = entry_result?;
+                    max_key = Some(key);
+                    count += 1;
+                }
+            }
+
+            (
+                min_key.unwrap_or_default(),
+                max_key.unwrap_or_default(),
+                count,
+            )
+        };
+
         memtable.flush(&mut sstable)?;
         let table = sstable.finalize()?;
 
@@ -41,9 +68,9 @@ impl FlushTask {
             id: table_id,
             level: 0,
             size: std::fs::metadata(&table_path)?.len(),
-            entry_count: 0,  // TODO: get actual count from table
-            min_key: vec![], // TODO: get from table
-            max_key: vec![], // TODO: get from table
+            entry_count,
+            min_key,
+            max_key,
         };
 
         // Update manifest (I/O - no locks held)

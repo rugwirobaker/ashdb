@@ -125,8 +125,8 @@ mod tests {
             let wal_path = wal_dir.join(format!("{}.wal", i));
             let wal = Wal::new(wal_path.to_str().unwrap())?;
             wal.append(
-                &format!("key{}", i).as_bytes(),
-                Some(&format!("value{}", i).as_bytes()),
+                format!("key{}", i).as_bytes(),
+                Some(format!("value{}", i).as_bytes()),
             )?;
             wal.flush()?;
         }
