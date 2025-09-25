@@ -17,40 +17,50 @@ pub fn needs_compaction(state: &LsmState, config: &CompactionConfig) -> bool {
     find_compaction_level(state, config).is_some()
 }
 
-/// Check which level needs compaction in tiered strategy
+/// Determines which level, if any, requires compaction based on a tiered strategy.
+///
+/// Compaction is triggered based on a hierarchy of rules:
+/// 1. **L0 Compaction:** The highest priority. Triggered if L0 has too many tables,
+///    as these tables can have overlapping key ranges and slow down reads.
+/// 2. **Size Ratio Compaction (L1+):** Triggered for a level `N` if its total size is
+///    significantly larger (by a configurable ratio) than the next level `N+1`. This
+///    keeps the size of levels growing exponentially, which is the goal of tiered compaction.
+/// 3. **Last Level Compaction:** If a level is the final one, it's compacted only if it
+///    accumulates too many individual table files, as there's no "next level" to compare its size against.
 pub fn find_compaction_level(state: &LsmState, config: &CompactionConfig) -> Option<u32> {
     let levels = state.levels.read().unwrap();
 
-    // First priority: L0 compaction
+    // Rule 1: L0 is the highest priority, triggered by the number of tables.
     if !levels.is_empty() && levels[0].table_count() > config.level0_compaction_threshold {
         return Some(0);
     }
 
-    // Check higher levels for size-ratio based compaction
-    for level_num in 1..levels.len() {
-        let current_level = &levels[level_num];
-
-        // Skip if level has fewer than max_tables_per_level tables
+    // Rules 2 & 3: Check higher levels for size-ratio or last-level table count triggers.
+    for (level_idx, current_level) in levels.iter().enumerate().skip(1) {
+        // First, a level must have a minimum number of tables to be considered for compaction.
+        // This avoids compacting levels that are mostly empty or have just been compacted.
         if current_level.table_count() < config.max_tables_per_level {
             continue;
         }
 
-        // Check size ratio against next level
-        if level_num + 1 < levels.len() {
-            let next_level = &levels[level_num + 1];
-            let current_size = current_level.size();
-            let next_size = next_level.size().max(1); // Avoid division by zero
-            let size_ratio = current_size / next_size;
+        let level_num = level_idx as u32;
 
-            if size_ratio >= config.size_ratio_threshold as u64 {
-                return Some(level_num as u32);
-            }
-        } else {
-            // If next level doesn't exist, compact when we have too many tables
-            return Some(level_num as u32);
+        // Rule 3: Handle the special case for the last level and return immediately if it matches.
+        let is_last_level = level_idx == levels.len() - 1;
+        if is_last_level {
+            return Some(level_num);
+        }
+
+        // Rule 2: If we are here, it's an intermediate level. Check the size ratio.
+        let next_level = &levels[level_idx + 1];
+        let current_size = current_level.size();
+        let next_size = next_level.size().max(1);
+
+        let is_oversized = current_size / next_size >= config.size_ratio_threshold as u64;
+        if is_oversized {
+            return Some(level_num);
         }
     }
-
     None
 }
 
@@ -146,7 +156,7 @@ pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
         writable_table.add_block(&block_data, first_key)?;
     }
 
-    let finalized_table = writable_table.finalize()?;
+    let table = writable_table.finalize()?;
 
     // 3. Create table metadata
     let table_meta = super::manifest::meta::TableMeta {
@@ -205,23 +215,8 @@ pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
         }
 
         // Add new table to target level
-        let readable_table = match finalized_table {
-            super::sstable::table::Table::Readable(r) => r,
-            _ => {
-                return Err(crate::Error::InvalidOperation(
-                    "Expected readable table".to_string(),
-                ))
-            }
-        };
-
-        levels[target_level as usize].add_sstable(SSTable {
-            id: table_id,
-            table: super::sstable::table::Table::Readable(readable_table),
-            path: table_path,
-            size: table_meta.size,
-            min_key: table_meta.min_key.clone(),
-            max_key: table_meta.max_key.clone(),
-        });
+        let sstable = SSTable::new(table_path, table, &table_meta)?;
+        levels[target_level as usize].add_sstable(sstable);
     }
 
     // 6. Delete old SSTable files

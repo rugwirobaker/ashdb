@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::sstable::table::{self, Table};
+use super::{manifest::meta::TableMeta, sstable::table::Table};
 use crate::error::Result;
 
 pub struct SSTable {
@@ -13,20 +13,19 @@ pub struct SSTable {
 }
 
 impl SSTable {
-    /// Creates a new `SSTable` with a given ID, table, path, and size.
-    pub fn new(id: u64, path: String, size: u64) -> Result<Self> {
-        let table = table::Table::readable(&path).unwrap();
-
-        let min_key = table.min_key().to_vec();
-        let max_key = table.max_key().to_vec();
-
+    /// Creates a new `SSTable` with atable, path, and size.
+    /// Creates a new `SSTable` from its on-disk file and its corresponding manifest metadata.
+    ///
+    /// This is the single, canonical way to create an SSTable instance, ensuring that the in-memory
+    /// representation is always consistent with the metadata stored in the manifest.
+    pub fn new(path: PathBuf, table: Table, table_meta: &TableMeta) -> Result<Self> {
         Ok(Self {
-            id,
+            id: table_meta.id,
             table,
-            path: PathBuf::from(&path),
-            size,
-            min_key,
-            max_key,
+            path,
+            size: table_meta.size,
+            min_key: table_meta.min_key.clone(),
+            max_key: table_meta.max_key.clone(),
         })
     }
 }

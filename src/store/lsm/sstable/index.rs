@@ -1,3 +1,62 @@
+// src/store/lsm/sstable/block.rs
+
+//! This module implements the data block, which is the basic unit of storage in an
+//! SSTable. A block contains a sequence of sorted key-value pairs, with keys being
+//! prefix-compressed to save space.
+//!
+//! ## Block Format
+//!
+//! A block is composed of a sequence of entries, followed by a list of restart
+//! points and the number of restart points.
+//!
+//! ```text
+//! +-----------------------------------------+
+//! | Entry 1                                 |
+//! +-----------------------------------------+
+//! | Entry 2                                 |
+//! +-----------------------------------------+
+//! | ...                                     |
+//! +-----------------------------------------+
+//! | Entry N                                 |
+//! +-----------------------------------------+
+//! | Restart Point 1 (u32)                   |
+//! +-----------------------------------------+
+//! | ...                                     |
+//! +-----------------------------------------+
+//! | Restart Point M (u32)                   |
+//! +-----------------------------------------+
+//! | Number of Restart Points (u32)          |
+//! +-----------------------------------------+
+//! ```
+//!
+//! ### Entry Format
+//!
+//! Each entry stores a key-value pair. To reduce storage space, keys are prefix-
+//! compressed. The first key in a restart interval is stored fully. Subsequent keys
+//! share a prefix with the previous key.
+//!
+//! ```text
+//! +--------------------------+
+//! | Shared Prefix Length (u16) |
+//! +--------------------------+
+//! | Unshared Key Length (u16)|
+//! +--------------------------+
+//! | Value Length (u32)       |
+//! +--------------------------+
+//! | Unshared Key             |
+//! +--------------------------+
+//! | Value                    |
+//! +--------------------------+
+//! ```
+//!
+//! ### Restart Points
+//!
+//! To allow for efficient seeking within a block, restart points are used. A restart
+//! point is the offset of an entry where the key is stored fully, without prefix
+//! compression. By default, a restart point is created every 16 entries. The list
+//! of restart points is stored at the end of the block, which allows for a binary
+//! search to find the correct restart point when seeking.
+//!
 use std::convert::TryFrom;
 use std::io::{Read, Write};
 use std::ops::RangeBounds;
@@ -7,6 +66,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use crate::error::Result;
 use crate::Error;
 
+/// An entry in the sparse index, representing a single data block.
 #[derive(Debug)]
 pub struct Entry<'a> {
     pub index: usize,  // The index of the entry in the sparse index
@@ -15,9 +75,13 @@ pub struct Entry<'a> {
     pub size: u64,     // Size of the block
 }
 
+/// The sparse index for an SSTable. It contains an ordered list of entries,
+/// where each entry corresponds to a data block.
 #[derive(Debug, Clone)]
 pub struct Index {
-    entries: Vec<(Vec<u8>, u64, u64)>, // Key, block offset, block size
+    /// The entries in the index, sorted by key. Each entry is a tuple of
+    /// `(key, block_offset, block_size)`.
+    entries: Vec<(Vec<u8>, u64, u64)>,
 }
 
 impl Index {
@@ -34,7 +98,12 @@ impl Index {
         self.entries.push((key, offset, size));
     }
 
-    /// Finds the closest entry that matches or precedes the given key
+    /// Finds the data block that may contain the given key.
+    ///
+    /// This method performs a binary search on the index entries. If an exact match
+    /// is found, it returns the corresponding entry. Otherwise, it returns the
+    /// entry for the block that *precedes* the block where the key would be, which
+    /// is the correct block to search.
     pub fn find(&self, key: &[u8]) -> Option<Entry> {
         let mut low = 0;
         let mut high = self.entries.len();
@@ -88,6 +157,17 @@ impl Index {
         self.entries.len()
     }
 
+    pub fn first_key(&self) -> Option<&[u8]> {
+        self.entries.first().map(|(key, _, _)| key.as_slice())
+    }
+
+    /// Returns the handle (offset and size) for the last block in the SSTable.
+    pub fn last_block_handle(&self) -> Option<(u64, u64)> {
+        self.entries
+            .last()
+            .map(|(_, offset, size)| (*offset, *size))
+    }
+
     // /// Gets the key for a given entry index
     // pub fn key(&self, index: usize) -> Option<&[u8]> {
     //     self.entries.get(index).map(|(key, _)| key.as_slice())
@@ -100,35 +180,69 @@ impl Index {
 }
 
 impl Index {
+    // In src/store/lsm/sstable/index.rs
+
     pub fn range(&self, range: impl RangeBounds<Vec<u8>>) -> Vec<(u64, u64)> {
-        let mut start_index = 0;
-        let mut end_index = self.entries.len();
-
-        if let std::ops::Bound::Included(start) = range.start_bound() {
-            start_index = self
-                .entries
-                .binary_search_by(|entry| entry.0.as_slice().cmp(start))
-                .unwrap_or_else(|idx| idx);
-        } else if let std::ops::Bound::Excluded(start) = range.start_bound() {
-            start_index = self
-                .entries
-                .binary_search_by(|entry| entry.0.as_slice().cmp(start))
-                .unwrap_or_else(|idx| idx);
-            if start_index < self.entries.len() {
-                start_index += 1;
+        let start_index = match range.start_bound() {
+            std::ops::Bound::Included(start) => {
+                // Find the first block that could contain the start key
+                match self
+                    .entries
+                    .binary_search_by(|entry| entry.0.as_slice().cmp(start))
+                {
+                    Ok(idx) => idx, // Key found exactly, start with this block
+                    Err(idx) => {
+                        // Key not found, idx is the insertion point
+                        // We want the block that could contain this key, which is the previous block
+                        idx.saturating_sub(1)
+                    }
+                }
             }
-        }
+            std::ops::Bound::Excluded(start) => {
+                // Find the first block that could contain keys > start
+                match self
+                    .entries
+                    .binary_search_by(|entry| entry.0.as_slice().cmp(start))
+                {
+                    Ok(idx) => {
+                        // Exact match found. For exclusion, we want blocks that may contain keys > start
+                        // This could be the same block (if it has keys > start) or the next block
+                        idx
+                    }
+                    Err(idx) => {
+                        // Key not found, idx is the insertion point
+                        // We want the block that could contain this key, which is the previous block
+                        idx.saturating_sub(1)
+                    }
+                }
+            }
+            std::ops::Bound::Unbounded => 0,
+        };
 
-        if let std::ops::Bound::Included(end) = range.end_bound() {
-            end_index = self
-                .entries
-                .binary_search_by(|entry| entry.0.as_slice().cmp(end))
-                .unwrap_or_else(|idx| idx + 1);
-        } else if let std::ops::Bound::Excluded(end) = range.end_bound() {
-            end_index = self
-                .entries
-                .binary_search_by(|entry| entry.0.as_slice().cmp(end))
-                .unwrap_or_else(|idx| idx);
+        let end_index = match range.end_bound() {
+            std::ops::Bound::Included(end) => {
+                match self
+                    .entries
+                    .binary_search_by(|entry| entry.0.as_slice().cmp(end))
+                {
+                    Ok(idx) => idx + 1, // Key found, include it by specifying the next index as the end.
+                    Err(idx) => idx,    // Key not found, the insertion point is the exclusive end.
+                }
+            }
+            std::ops::Bound::Excluded(end) => {
+                match self
+                    .entries
+                    .binary_search_by(|entry| entry.0.as_slice().cmp(end))
+                {
+                    Ok(idx) => idx,  // Key found, exclude it.
+                    Err(idx) => idx, // Key not found, the insertion point is the correct end.
+                }
+            }
+            std::ops::Bound::Unbounded => self.entries.len(),
+        };
+
+        if start_index >= end_index {
+            return Vec::new();
         }
 
         self.entries[start_index..end_index]
@@ -200,5 +314,103 @@ impl TryInto<Vec<u8>> for Index {
             buffer.write_u64::<BigEndian>(size)?; // Write block size
         }
         Ok(buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::TryInto;
+
+    fn create_test_index() -> Index {
+        let mut index = Index::new();
+        index.push(b"apple".to_vec(), 0, 100);
+        index.push(b"banana".to_vec(), 100, 100);
+        index.push(b"cherry".to_vec(), 200, 100);
+        index
+    }
+
+    #[test]
+    fn test_find_exact_match() {
+        let index = create_test_index();
+        let entry = index.find(b"banana").unwrap();
+        assert_eq!(entry.key, b"banana");
+        assert_eq!(entry.offset, 100);
+    }
+
+    #[test]
+    fn test_find_between_entries() {
+        let index = create_test_index();
+        let entry = index.find(b"apricot").unwrap();
+        assert_eq!(entry.key, b"apple");
+        assert_eq!(entry.offset, 0);
+    }
+
+    #[test]
+    fn test_find_smaller_than_all() {
+        let index = create_test_index();
+        assert!(index.find(b"ant").is_none());
+    }
+
+    #[test]
+    fn test_find_larger_than_all() {
+        let index = create_test_index();
+        let entry = index.find(b"date").unwrap();
+        assert_eq!(entry.key, b"cherry");
+        assert_eq!(entry.offset, 200);
+    }
+
+    #[test]
+    fn test_find_empty_index() {
+        let index = Index::new();
+        assert!(index.find(b"any").is_none());
+    }
+
+    #[test]
+    fn test_serialization_roundtrip() {
+        let original_index = create_test_index();
+        let buffer: Vec<u8> = original_index.clone().try_into().unwrap();
+        let deserialized_index = Index::try_from(buffer.as_slice()).unwrap();
+
+        assert_eq!(original_index.entries, deserialized_index.entries);
+    }
+
+    #[test]
+    fn test_empty_serialization_roundtrip() {
+        let original_index = Index::new();
+        let buffer: Vec<u8> = original_index.clone().try_into().unwrap();
+        let deserialized_index = Index::try_from(buffer.as_slice()).unwrap();
+
+        assert_eq!(original_index.entries, deserialized_index.entries);
+    }
+
+    #[test]
+    fn test_range_full() {
+        let index = create_test_index();
+        let range = index.range(..);
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0], (0, 100));
+        assert_eq!(range[1], (100, 100));
+        assert_eq!(range[2], (200, 100));
+    }
+
+    #[test]
+    fn test_range_partial_inclusive() {
+        let index = create_test_index();
+        // Range includes "banana" and "cherry"
+        let range = index.range(b"banana".to_vec()..=b"cherry".to_vec());
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0], (100, 100)); // banana
+        assert_eq!(range[1], (200, 100)); // cherry
+    }
+
+    #[test]
+    fn test_range_partial_exclusive() {
+        let index = create_test_index();
+        // Range includes "apple" and "banana", but excludes "cherry"
+        let range = index.range(b"apple".to_vec()..b"cherry".to_vec());
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0], (0, 100)); // apple
+        assert_eq!(range[1], (100, 100)); // banana
     }
 }
