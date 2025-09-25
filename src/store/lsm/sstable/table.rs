@@ -241,7 +241,7 @@ mod tests {
     use crate::tmpfs::NamedTempFile;
 
     use super::*;
-    use crate::sstable::block::Builder;
+    use crate::store::lsm::sstable::block::Builder;
 
     #[test]
     fn test_write_and_read() {

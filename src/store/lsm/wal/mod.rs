@@ -287,8 +287,9 @@ impl Iterator for ReplayIterator {
 
 #[cfg(test)]
 mod tests {
+    use super::header::HEADER_SIZE;
     use super::Wal;
-    use crate::{tmpfs::NamedTempFile, wal::header::HEADER_SIZE, Error};
+    use crate::{tmpfs::NamedTempFile, Error};
     use std::io::{Seek, SeekFrom, Write};
 
     fn create_temp_wal() -> Wal {

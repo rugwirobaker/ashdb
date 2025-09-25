@@ -6,11 +6,8 @@ use std::{
     },
 };
 
-use crate::{
-    manifest::Manifest,
-    memtable::{ActiveMemtable, FrozenMemtable},
-    store::level::Level,
-};
+use super::memtable::{ActiveMemtable, FrozenMemtable};
+use super::{manifest::Manifest, Level};
 
 /// All mutable state for the LSM store with fine-grained locking
 pub struct LsmState {
