@@ -124,6 +124,21 @@ impl LsmStore {
     pub fn mark_flush_completed(&self) {
         self.state.mark_flush_completed()
     }
+
+    /// Get flush interval from config
+    pub fn flush_interval(&self) -> std::time::Duration {
+        self.config.flush_interval
+    }
+
+    /// Get compaction interval from config
+    pub fn compaction_interval(&self) -> std::time::Duration {
+        self.config.compaction_interval
+    }
+
+    /// Get WAL cleanup interval from config
+    pub fn wal_cleanup_interval(&self) -> std::time::Duration {
+        self.config.wal_cleanup_interval
+    }
 }
 
 impl Drop for LsmStore {

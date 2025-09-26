@@ -1,4 +1,5 @@
 pub mod config;
+pub mod encoding;
 pub mod error;
 pub mod flock;
 pub mod hasher;

@@ -3,3 +3,6 @@ test.wal
 .DS_Store
 *_DESIGN.md
 rocksdb-paper.pdf
+ashdb_data
+data
+cli_tests

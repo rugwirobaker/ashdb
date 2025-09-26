@@ -16,16 +16,7 @@ pub struct LsmConfig {
     /// WAL buffer size (default: 64KB)
     pub wal_buffer_size: usize,
 
-    /// Scheduler configuration
-    pub scheduler: SchedulerConfig,
-
-    /// Compaction configuration
-    pub compaction: CompactionConfig,
-}
-
-#[derive(Debug, Clone)]
-pub struct SchedulerConfig {
-    /// How often to check for flush opportunities (default: 1s)
+    /// How often to check for flush opportunities (default: 3s)
     pub flush_interval: Duration,
 
     /// How often to check for compaction opportunities (default: 10s)
@@ -34,8 +25,8 @@ pub struct SchedulerConfig {
     /// How often to clean up old WAL files (default: 30s)
     pub wal_cleanup_interval: Duration,
 
-    /// How often to collect metrics (default: 5s)
-    pub metrics_interval: Duration,
+    /// Compaction configuration
+    pub compaction: CompactionConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -69,19 +60,10 @@ impl Default for LsmConfig {
             max_memtable_size: 64 * 1024 * 1024, // 64MB
             wal_direct_io: false,
             wal_buffer_size: 64 * 1024, // 64KB
-            scheduler: SchedulerConfig::default(),
-            compaction: CompactionConfig::default(),
-        }
-    }
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            flush_interval: Duration::from_secs(1),
+            flush_interval: Duration::from_secs(3),
             compaction_interval: Duration::from_secs(10),
             wal_cleanup_interval: Duration::from_secs(30),
-            metrics_interval: Duration::from_secs(5),
+            compaction: CompactionConfig::default(),
         }
     }
 }
@@ -113,20 +95,6 @@ impl LsmConfig {
         self
     }
 
-    /// Configure scheduler settings
-    pub fn scheduler(mut self, config: SchedulerConfig) -> Self {
-        self.scheduler = config;
-        self
-    }
-
-    /// Configure compaction settings
-    pub fn compaction(mut self, config: CompactionConfig) -> Self {
-        self.compaction = config;
-        self
-    }
-}
-
-impl SchedulerConfig {
     /// Set flush check interval
     pub fn flush_interval(mut self, interval: Duration) -> Self {
         self.flush_interval = interval;
@@ -145,9 +113,9 @@ impl SchedulerConfig {
         self
     }
 
-    /// Set metrics collection interval
-    pub fn metrics_interval(mut self, interval: Duration) -> Self {
-        self.metrics_interval = interval;
+    /// Configure compaction settings
+    pub fn compaction(mut self, config: CompactionConfig) -> Self {
+        self.compaction = config;
         self
     }
 }
@@ -195,11 +163,9 @@ mod tests {
         let config = LsmConfig::new("/tmp/test")
             .max_memtable_size(32 * 1024 * 1024)
             .wal_direct_io(true)
-            .scheduler(
-                SchedulerConfig::default()
-                    .flush_interval(Duration::from_millis(500))
-                    .compaction_interval(Duration::from_secs(5)),
-            )
+            .flush_interval(Duration::from_millis(500))
+            .compaction_interval(Duration::from_secs(5))
+            .wal_cleanup_interval(Duration::from_secs(15))
             .compaction(
                 CompactionConfig::default()
                     .level0_compaction_threshold(2)
@@ -211,9 +177,10 @@ mod tests {
         assert_eq!(config.max_memtable_size, 32 * 1024 * 1024);
         assert!(config.wal_direct_io);
 
-        // Test scheduler config
-        assert_eq!(config.scheduler.flush_interval, Duration::from_millis(500));
-        assert_eq!(config.scheduler.compaction_interval, Duration::from_secs(5));
+        // Test background task intervals
+        assert_eq!(config.flush_interval, Duration::from_millis(500));
+        assert_eq!(config.compaction_interval, Duration::from_secs(5));
+        assert_eq!(config.wal_cleanup_interval, Duration::from_secs(15));
 
         // Test compaction config
         assert_eq!(config.compaction.level0_compaction_threshold, 2);

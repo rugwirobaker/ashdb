@@ -23,7 +23,7 @@ impl BackgroundTask for CompactionTask {
     }
 
     fn interval(&self) -> Duration {
-        self.store.config.scheduler.compaction_interval
+        self.store.config.compaction_interval
     }
 
     async fn execute(&self, _ctx: Context) -> Result<()> {
@@ -53,7 +53,7 @@ impl BackgroundTask for FlushTask {
     }
 
     fn interval(&self) -> Duration {
-        self.store.config.scheduler.flush_interval
+        self.store.config.flush_interval
     }
 
     async fn execute(&self, _ctx: Context) -> Result<()> {
@@ -89,7 +89,7 @@ impl BackgroundTask for MetricsTask {
     }
 
     fn interval(&self) -> Duration {
-        self.store.config.scheduler.metrics_interval
+        Duration::from_secs(5) // Fixed interval for metrics
     }
 
     async fn execute(&self, _ctx: Context) -> Result<()> {
@@ -115,7 +115,7 @@ impl BackgroundTask for WalCleanupTask {
     }
 
     fn interval(&self) -> Duration {
-        self.store.config.scheduler.wal_cleanup_interval
+        self.store.config.wal_cleanup_interval
     }
 
     async fn execute(&self, _ctx: Context) -> Result<()> {
