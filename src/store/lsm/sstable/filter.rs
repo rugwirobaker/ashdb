@@ -20,7 +20,7 @@ use std::ops::{Bound, RangeBounds};
 pub struct RangeFilter<I, R>
 where
     I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
-    R: RangeBounds<Vec<u8>>,
+    R: RangeBounds<Vec<u8>> + Send + Sync,
 {
     inner: I,
     range: R,
@@ -29,7 +29,7 @@ where
 impl<I, R> RangeFilter<I, R>
 where
     I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
-    R: RangeBounds<Vec<u8>>,
+    R: RangeBounds<Vec<u8>> + Send + Sync,
 {
     /// Create a new range filter that wraps the given iterator.
     pub fn new(inner: I, range: R) -> Self {
@@ -84,7 +84,7 @@ where
 impl<I, R> Iterator for RangeFilter<I, R>
 where
     I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
-    R: RangeBounds<Vec<u8>>,
+    R: RangeBounds<Vec<u8>> + Send + Sync,
 {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
 

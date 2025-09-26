@@ -129,7 +129,7 @@ impl Table {
     /// Returns an `InvalidOperation` error if the table is in a writable state.
     pub fn scan<R>(&self, range: R) -> Result<ScanIterator<R>>
     where
-        R: RangeBounds<Vec<u8>> + Clone,
+        R: RangeBounds<Vec<u8>> + Clone + Send + Sync,
     {
         match self {
             Table::Readable(readable) => readable.scan(range),
@@ -218,7 +218,7 @@ impl ReadableTable {
     /// Creates an iterator over a range of key-value pairs.
     pub fn scan<R>(&self, range: R) -> Result<ScanIterator<R>>
     where
-        R: RangeBounds<Vec<u8>> + Clone,
+        R: RangeBounds<Vec<u8>> + Clone + Send + Sync,
     {
         let blocks = self.index.range(range.clone());
         let reader = self.file.try_clone()?;

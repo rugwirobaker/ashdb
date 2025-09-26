@@ -2,7 +2,7 @@ use crate::error::Result;
 use std::{cmp::Ordering, collections::BinaryHeap, ops::RangeBounds, sync::Arc};
 
 /// Type alias for complex iterator used in merge operations
-pub type KvIterator<'a> = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>;
+pub type KvIterator<'a> = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + Send + Sync + 'a>;
 
 // Iterator implementations
 pub struct OwningMemtableIter {

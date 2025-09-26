@@ -15,11 +15,11 @@ const LOCK_FILE: &str = "ashdb.lock";
 /// LSM Store with interior mutability
 pub struct LsmStore {
     // Immutable configuration (public for background tasks)
-    pub(crate) config: LsmConfig,
+    pub(super) config: LsmConfig,
     lock: Option<FileLock>,
 
     // Shared mutable state (public for background tasks)
-    pub(crate) state: Arc<LsmState>,
+    pub(super) state: Arc<LsmState>,
 }
 
 impl LsmStore {
@@ -186,8 +186,12 @@ impl Store for LsmStore {
         Ok(None)
     }
 
-    fn scan<'a>(&'a self, range: impl RangeBounds<Vec<u8>> + 'a + Clone) -> Self::ScanIterator<'a> {
-        type BoxedResultIterator<'a> = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>;
+    fn scan<'a>(
+        &'a self,
+        range: impl RangeBounds<Vec<u8>> + Clone + Send + Sync + 'a,
+    ) -> Self::ScanIterator<'a> {
+        type BoxedResultIterator<'a> =
+            Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + Send + Sync + 'a>;
 
         // Clone Arc to extend lifetime beyond lock
         let active_arc = {
