@@ -1,3 +1,48 @@
+//! Memtable implementation using a concurrent skip list.
+//!
+//! This module provides an in-memory sorted data structure for storing key-value
+//! pairs before they are written to disk. The memtable serves as the first level
+//! in the LSM-tree hierarchy and is optimized for both high write throughput
+//! and efficient read access.
+//!
+//! # Data Structure Choice: Skip List
+//!
+//! A skip list was chosen over alternatives like B-trees or red-black trees for
+//! several key reasons:
+//!
+//! - **Lock-free concurrency**: Supports multiple concurrent readers without locks
+//! - **Ordered traversal**: Naturally maintains lexicographical key ordering
+//! - **Memory efficiency**: Lower memory overhead compared to tree structures
+//! - **Cache performance**: Better cache locality for sequential scans
+//! - **Probabilistic balancing**: Self-balancing without complex rebalancing
+//!
+//! # Crossbeam SkipMap
+//!
+//! We specifically use `crossbeam-skiplist::SkipMap` because:
+//!
+//! - **Memory ordering**: Provides strong consistency guarantees using atomic operations
+//! - **Concurrent reads**: Multiple threads can read simultaneously without blocking
+//! - **Range queries**: Efficient support for bounded range iteration
+//! - **Memory safety**: No unsafe code required for concurrent access
+//! - **Performance**: Optimized implementation with minimal contention
+//!
+//! # Lifecycle Management
+//!
+//! Memtables progress through these states:
+//! 1. **Active**: Accepts new writes and grows until size limit
+//! 2. **Frozen**: Read-only, queued for flushing to disk
+//! 3. **Flushed**: Converted to SSTable and removed from memory
+//!
+//! The freeze operation is atomic using `AtomicBool` to ensure consistency
+//! during concurrent access.
+//!
+//! # WAL Integration
+//!
+//! Each memtable is paired with a Write-Ahead Log (WAL) file for durability:
+//! - Writes go to WAL first, then to memtable
+//! - WAL enables recovery after crashes
+//! - WAL is removed after memtable is flushed to SSTable
+
 use super::super::filter::RangeFilter;
 use super::super::sstable::{block, table};
 use super::super::wal::Wal;
@@ -10,6 +55,10 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+/// In-memory sorted table using a concurrent skip list.
+///
+/// Stores key-value pairs in memory with atomic size tracking and freeze state.
+/// Each memtable is associated with a WAL file for durability.
 #[derive(Debug)]
 pub struct Memtable {
     data: Arc<SkipMap<Vec<u8>, Option<Vec<u8>>>>,

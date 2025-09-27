@@ -1,3 +1,60 @@
+//! Manifest log for tracking SSTable metadata and LSM-tree state.
+//!
+//! The manifest is essentially a WAL (Write-Ahead Log) for database metadata
+//! instead of user data. While the WAL tracks changes to key-value pairs, the
+//! manifest tracks changes to the database structure itself - which SSTables
+//! exist, their metadata, and the operations that created or deleted them.
+//!
+//! # File Format
+//!
+//! Like the WAL, the manifest uses an append-only log format:
+//!
+//! ```text
+//! +------------------+
+//! | Header (64 bytes)|
+//! +------------------+
+//! | VersionEdit 1    |
+//! +------------------+
+//! | VersionEdit 2    |
+//! +------------------+
+//! | ...              |
+//! +------------------+
+//! ```
+//!
+//! ## VersionEdit Format
+//!
+//! Each version edit represents an atomic change to the LSM-tree structure:
+//!
+//! ```text
+//! +-----------+------------------+-----------+
+//! |length:u32 | serialized_edit  |crc32:u32  |
+//! +-----------+------------------+-----------+
+//! | 4 bytes   | variable length  | 4 bytes   |
+//! +-----------+------------------+-----------+
+//! ```
+//!
+//! ## Edit Operations
+//!
+//! - **AddTable**: Records new SSTable creation (from flush or compaction)
+//! - **DeleteTable**: Records SSTable deletion (after compaction)
+//! - **SetNextWalId**: Updates the next WAL file ID counter
+//! - **SetNextTableId**: Updates the next SSTable ID counter
+//!
+//! # Recovery Process
+//!
+//! On startup, the manifest is replayed to reconstruct the LSM-tree state:
+//! 1. Read and validate the header
+//! 2. Apply each VersionEdit in sequence
+//! 3. Rebuild the level structure and metadata
+//! 4. Verify referenced SSTables exist
+//!
+//! # Durability and Consistency
+//!
+//! - **Big-endian encoding**: Ensures cross-platform portability
+//! - **CRC32 checksums**: Detects corruption in individual edits
+//! - **Atomic writes**: Each edit is written atomically
+//! - **Immediate sync**: Changes are synced to disk before returning
+
 pub mod edit;
 pub mod header;
 pub mod meta;

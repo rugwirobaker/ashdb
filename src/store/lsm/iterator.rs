@@ -1,3 +1,41 @@
+//! Iterator merge algorithms for LSM-tree scan operations.
+//!
+//! This module implements efficient merging of multiple sorted iterators from
+//! different data sources (memtables, SSTables) while maintaining lexicographical
+//! order and handling key deduplication.
+//!
+//! # Merge Strategy
+//!
+//! The core challenge is efficiently merging N sorted streams while:
+//! - Maintaining lexicographical key ordering
+//! - Handling duplicate keys (newer values win)
+//! - Minimizing memory usage through lazy evaluation
+//! - Supporting efficient range queries
+//!
+//! # Binary Heap Implementation
+//!
+//! We use a min-heap (BinaryHeap with reversed ordering) to efficiently
+//! find the next smallest key across all iterators:
+//!
+//! ```text
+//! Iterators:  [a, d, g, ...]  [b, e, h, ...]  [c, f, i, ...]
+//!                 ↓               ↓               ↓
+//! Heap:       [   a,              b,              c     ]
+//!                 ↓ (pop minimum)
+//! Output:         a
+//! ```
+//!
+//! # Key Deduplication
+//!
+//! When the same key appears in multiple sources, the iterator with the
+//! lowest source index wins (newer data sources have lower indices).
+//! This implements the LSM-tree property where newer writes shadow older ones.
+//!
+//! # Lazy Evaluation
+//!
+//! The iterator only pulls data from source iterators as needed, reducing
+//! memory pressure for large scans and enabling efficient early termination.
+
 use crate::error::Result;
 use std::{cmp::Ordering, collections::BinaryHeap};
 

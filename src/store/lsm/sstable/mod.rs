@@ -1,40 +1,94 @@
 // src/store/lsm/sstable/mod.rs
 
-//! This module implements the Sorted String Table (SSTable), which is the on-disk
-//! storage format for the LSM-tree. SSTables are immutable and contain a sequence of
-//! sorted key-value pairs.
+//! Sorted String Table (SSTable) implementation for persistent storage.
 //!
-//! The SSTable format is designed for efficient reads, especially scans, and is
-//! composed of three main parts:
+//! SSTables provide the durable storage layer of the LSM-tree, storing immutable
+//! sorted key-value pairs on disk with efficient read access patterns.
 //!
-//! 1.  **Data Blocks:** These are variable-sized blocks that store key-value pairs.
-//!     To save space, keys are prefix-compressed within each block. Restart points
-//!     are used to allow for efficient seeking within a block.
+//! # Architecture Overview
 //!
-//! 2.  **Index Block:** This is a sparse index that contains an entry for each data
-//!     block. The index entry consists of the first key of the block and the block's
-//!     offset and size in the file. This allows for a quick lookup of the block that
-//!     may contain a given key.
+//! The SSTable design balances storage efficiency with read performance through
+//! a multi-level structure optimized for both point lookups and range scans.
 //!
-//! 3.  **Footer:** The last 8 bytes of the file store the offset of the index block.
-//!
-//! ## File Layout
+//! ## File Format
 //!
 //! ```text
 //! +-------------------+
-//! | Data Block 1      |
+//! | Data Block 1      |  ← Variable size, ~4KB target
 //! +-------------------+
-//! | Data Block 2      |
+//! | Data Block 2      |  ← Contains prefix-compressed entries
 //! +-------------------+
 //! | ...               |
 //! +-------------------+
 //! | Data Block N      |
 //! +-------------------+
-//! | Index Block       |
+//! | Index Block       |  ← Sparse index for block lookup
 //! +-------------------+
-//! | Index Offset (u64)|
+//! | Index Offset (u64)|  ← Footer for index location
 //! +-------------------+
 //! ```
+//!
+//! # Component Details
+//!
+//! ## Data Blocks (`block.rs`)
+//!
+//! Data blocks are the fundamental storage units, typically ~4KB in size:
+//! - **Prefix compression**: Keys share common prefixes to reduce storage
+//! - **Restart points**: Every 16 entries, full keys are stored for efficient seeking
+//! - **Binary search**: Restart points enable O(log n) seeks within blocks
+//!
+//! ### Block Entry Format
+//! ```text
+//! +----------------+----------------+-------------+--------+-------+
+//! |shared_len:u16  |unshared_len:u16|value_len:u32| key   | value |
+//! +----------------+----------------+-------------+--------+-------+
+//! ```
+//!
+//! ## Sparse Index (`index.rs`)
+//!
+//! The index provides fast block location for any key:
+//! - **First key mapping**: Each entry maps a block's first key to its file offset
+//! - **Binary search**: O(log n) lookup to find the correct block
+//! - **Range optimization**: Efficiently identifies blocks needed for range scans
+//!
+//! ### Index Entry Format
+//! ```text
+//! +-------------+-----+----------+----------+
+//! |key_len:u16  | key |offset:u64|size:u64  |
+//! +-------------+-----+----------+----------+
+//! ```
+//!
+//! ## Table Management (`table.rs`)
+//!
+//! Handles SSTable lifecycle from creation to querying:
+//! - **State machine**: Enforces write-then-read lifecycle
+//! - **Concurrent access**: Multiple readers via file handle cloning
+//! - **Range filtering**: Combines index lookups with iterator chaining
+//!
+//! # Performance Characteristics
+//!
+//! - **Point lookups**: O(log blocks + log entries_per_block)
+//! - **Range scans**: O(log blocks + scan_size)
+//! - **Storage efficiency**: 15-30% space savings from prefix compression
+//! - **Cache friendly**: 4KB blocks align with OS page size
+//!
+//! # Future Optimizations
+//!
+//! ## Bloom Filters
+//! - **Block-level filters**: Reduce block reads for non-existent keys
+//! - **Table-level filters**: Skip entire SSTables during queries
+//! - **Space-time tradeoff**: ~10 bits per key for 1% false positive rate
+//!
+//! ## Block Caching
+//! - **LRU cache**: Keep frequently accessed blocks in memory
+//! - **Adaptive sizing**: Adjust cache based on workload patterns
+//! - **Prefetching**: Load adjacent blocks for sequential scans
+//!
+//! ## Async I/O Integration
+//! - **Non-blocking operations**: Prevent I/O from blocking other operations
+//! - **Batched I/O**: Group multiple block reads for efficiency
+//! - **Turso-style approach**: https://github.com/tursodatabase/turso/tree/main/core/io
+//! - **Zero-copy**: Direct buffer management for reduced allocations
 
 mod index;
 
