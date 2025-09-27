@@ -40,7 +40,10 @@
 //! - When a level becomes too large relative to the next, compact it
 //! - This maintains the exponential size growth property
 
-use super::{Level, LsmState, SSTable};
+use super::{
+    manifest::{Level, SSTable},
+    LsmState,
+};
 use crate::{config::CompactionConfig, error::Result};
 
 use super::iterator::{LSMIterator, LSMScanIterator};
@@ -104,7 +107,7 @@ pub fn find_compaction_level(state: &LsmState, config: &CompactionConfig) -> Opt
 }
 
 /// Perform tiered compaction if needed
-pub async fn compact(store: &super::LsmStore) -> Result<()> {
+pub async fn compact(store: &super::LsmTree) -> Result<()> {
     let state = &store.state;
     let config = &store.config;
     let _guard = state.start_compaction();
@@ -310,13 +313,13 @@ mod tests {
     fn create_test_store_with_config(
         temp_dir: &TempDir,
         config: CompactionConfig,
-    ) -> super::super::LsmStore {
+    ) -> super::super::LsmTree {
         let lsm_config = LsmConfig::new(temp_dir.path()).compaction(config);
-        super::super::LsmStore::open_with_config(lsm_config).expect("Failed to create store")
+        super::super::LsmTree::open_with_config(lsm_config).expect("Failed to create store")
     }
 
     // Helper function to create a test store with default aggressive compaction settings
-    fn create_test_store(temp_dir: &TempDir) -> super::super::LsmStore {
+    fn create_test_store(temp_dir: &TempDir) -> super::super::LsmTree {
         let compaction_config = CompactionConfig::default()
             .level0_compaction_threshold(2) // Lower threshold for easier testing
             .size_ratio_threshold(2) // Lower ratio for easier testing
@@ -327,7 +330,7 @@ mod tests {
 
     // Helper to populate data that will create multiple SSTables
     async fn populate_multiple_tables(
-        store: &super::super::LsmStore,
+        store: &super::super::LsmTree,
         table_count: usize,
     ) -> Result<()> {
         let entries_per_table = 100;
@@ -354,10 +357,7 @@ mod tests {
     }
 
     // Helper to verify data integrity after compaction
-    fn verify_data_integrity(
-        store: &super::super::LsmStore,
-        expected_entries: usize,
-    ) -> Result<()> {
+    fn verify_data_integrity(store: &super::super::LsmTree, expected_entries: usize) -> Result<()> {
         let mut count = 0;
         let mut last_key = None;
 

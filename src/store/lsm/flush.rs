@@ -1,8 +1,8 @@
-use super::{Level, SSTable};
+use super::manifest::{Level, SSTable};
 use crate::error::Result;
 
 /// Manually flush oldest frozen memtable to SSTable (for testing)
-pub async fn flush_memtable(store: &super::LsmStore) -> Result<bool> {
+pub async fn flush_memtable(store: &super::LsmTree) -> Result<bool> {
     // Check if flush needed and try to mark as pending
     if !store.needs_flush() || !store.state.try_mark_flush_pending() {
         return Ok(false);
@@ -137,13 +137,13 @@ mod tests {
     fn create_test_store_with_config(
         temp_dir: &TempDir,
         config: CompactionConfig,
-    ) -> super::super::LsmStore {
+    ) -> super::super::LsmTree {
         let lsm_config = LsmConfig::new(temp_dir.path()).compaction(config);
-        super::super::LsmStore::open_with_config(lsm_config).expect("Failed to create store")
+        super::super::LsmTree::open_with_config(lsm_config).expect("Failed to create store")
     }
 
     // Helper function to create a test store with default aggressive compaction settings
-    fn create_test_store(temp_dir: &TempDir) -> super::super::LsmStore {
+    fn create_test_store(temp_dir: &TempDir) -> super::super::LsmTree {
         let compaction_config = CompactionConfig::default()
             .level0_compaction_threshold(2) // Lower threshold for easier testing
             .size_ratio_threshold(2) // Lower ratio for easier testing
