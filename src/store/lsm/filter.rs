@@ -1,7 +1,8 @@
-//! Iterator filtering utilities for SSTable data.
+//! Iterator filtering utilities for LSM tree components.
 //!
 //! This module provides generic iterator adapters that can filter and transform
-//! streams of key-value pairs based on various criteria.
+//! streams of key-value pairs based on various criteria. These utilities are shared
+//! across all LSM components including memtables, SSTables, and merge iterators.
 
 use crate::error::Result;
 use std::ops::{Bound, RangeBounds};
@@ -20,7 +21,7 @@ use std::ops::{Bound, RangeBounds};
 pub struct RangeFilter<I, R>
 where
     I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
-    R: RangeBounds<Vec<u8>>,
+    R: RangeBounds<Vec<u8>> + Send + Sync,
 {
     inner: I,
     range: R,
@@ -29,7 +30,7 @@ where
 impl<I, R> RangeFilter<I, R>
 where
     I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
-    R: RangeBounds<Vec<u8>>,
+    R: RangeBounds<Vec<u8>> + Send + Sync,
 {
     /// Create a new range filter that wraps the given iterator.
     pub fn new(inner: I, range: R) -> Self {
@@ -84,7 +85,7 @@ where
 impl<I, R> Iterator for RangeFilter<I, R>
 where
     I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
-    R: RangeBounds<Vec<u8>>,
+    R: RangeBounds<Vec<u8>> + Send + Sync,
 {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
 

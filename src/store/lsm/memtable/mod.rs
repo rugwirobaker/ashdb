@@ -7,5 +7,5 @@ pub const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024; // 64MB
 
 // Re-export all types for easy access
 pub use active::ActiveMemtable;
-pub use core::{Memtable, ScanIter};
+pub use core::{Memtable, ScanIterator};
 pub use frozen::FrozenMemtable;

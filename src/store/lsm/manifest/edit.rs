@@ -8,8 +8,6 @@ const FLUSH: u8 = 0x01;
 const BEGIN_COMPACTION: u8 = 0x02;
 const COMMIT_COMPACTION: u8 = 0x03;
 const SNAPSHOT: u8 = 0x04;
-const ADD_SSTABLE: u8 = 0x05;
-const DELETE_SSTABLE: u8 = 0x06;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VersionEdit {
@@ -39,19 +37,6 @@ pub enum VersionEdit {
         seq: u64,
         levels: Vec<LevelMeta>,
         next_table_id: u64,
-        deletable_wals: Vec<u64>,
-    },
-
-    AddSSTable {
-        seq: u64,
-        level: u32,
-        table: TableMeta,
-    },
-
-    DeleteSSTable {
-        seq: u64,
-        table_id: u64,
-        level: u32,
     },
 }
 
@@ -61,9 +46,7 @@ impl VersionEdit {
             VersionEdit::Flush { seq, .. }
             | VersionEdit::BeginCompaction { seq, .. }
             | VersionEdit::CommitCompaction { seq, .. }
-            | VersionEdit::Snapshot { seq, .. }
-            | VersionEdit::AddSSTable { seq, .. }
-            | VersionEdit::DeleteSSTable { seq, .. } => *seq,
+            | VersionEdit::Snapshot { seq, .. } => *seq,
         }
     }
 
@@ -123,40 +106,15 @@ impl VersionEdit {
                 seq,
                 levels,
                 next_table_id,
-                deletable_wals,
             } => {
                 buf.write_u8(SNAPSHOT).unwrap();
                 buf.write_u64::<BigEndian>(*seq).unwrap();
                 buf.write_u64::<BigEndian>(*next_table_id).unwrap();
 
-                buf.write_u32::<BigEndian>(deletable_wals.len() as u32)
-                    .unwrap();
-                for wal_id in deletable_wals {
-                    buf.write_u64::<BigEndian>(*wal_id).unwrap();
-                }
-
                 buf.write_u32::<BigEndian>(levels.len() as u32).unwrap();
                 for level in levels {
                     level.encode_into(&mut buf);
                 }
-            }
-
-            VersionEdit::AddSSTable { seq, level, table } => {
-                buf.write_u8(ADD_SSTABLE).unwrap();
-                buf.write_u64::<BigEndian>(*seq).unwrap();
-                buf.write_u32::<BigEndian>(*level).unwrap();
-                table.encode_into(&mut buf);
-            }
-
-            VersionEdit::DeleteSSTable {
-                seq,
-                table_id,
-                level,
-            } => {
-                buf.write_u8(DELETE_SSTABLE).unwrap();
-                buf.write_u64::<BigEndian>(*seq).unwrap();
-                buf.write_u64::<BigEndian>(*table_id).unwrap();
-                buf.write_u32::<BigEndian>(*level).unwrap();
             }
         }
 
@@ -221,12 +179,6 @@ impl VersionEdit {
                 let seq = cursor.read_u64::<BigEndian>()?;
                 let next_table_id = cursor.read_u64::<BigEndian>()?;
 
-                let wal_count = cursor.read_u32::<BigEndian>()? as usize;
-                let mut deletable_wals = Vec::with_capacity(wal_count);
-                for _ in 0..wal_count {
-                    deletable_wals.push(cursor.read_u64::<BigEndian>()?);
-                }
-
                 let level_count = cursor.read_u32::<BigEndian>()? as usize;
                 let mut levels = Vec::with_capacity(level_count);
                 for _ in 0..level_count {
@@ -237,25 +189,6 @@ impl VersionEdit {
                     seq,
                     levels,
                     next_table_id,
-                    deletable_wals,
-                })
-            }
-
-            ADD_SSTABLE => {
-                let seq = cursor.read_u64::<BigEndian>()?;
-                let level = cursor.read_u32::<BigEndian>()?;
-                let table = TableMeta::decode_from(&mut cursor)?;
-                Ok(VersionEdit::AddSSTable { seq, level, table })
-            }
-
-            DELETE_SSTABLE => {
-                let seq = cursor.read_u64::<BigEndian>()?;
-                let table_id = cursor.read_u64::<BigEndian>()?;
-                let level = cursor.read_u32::<BigEndian>()?;
-                Ok(VersionEdit::DeleteSSTable {
-                    seq,
-                    table_id,
-                    level,
                 })
             }
 
@@ -334,35 +267,6 @@ mod tests {
                 tables: vec![create_test_table_meta()],
             }],
             next_table_id: 50,
-            deletable_wals: vec![1, 2, 3],
-        };
-
-        let encoded = original.encode();
-        let decoded = VersionEdit::decode(&encoded).expect("Failed to decode");
-
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn test_add_sstable_roundtrip() {
-        let original = VersionEdit::AddSSTable {
-            seq: 3,
-            level: 1,
-            table: create_test_table_meta(),
-        };
-
-        let encoded = original.encode();
-        let decoded = VersionEdit::decode(&encoded).expect("Failed to decode");
-
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn test_delete_sstable_roundtrip() {
-        let original = VersionEdit::DeleteSSTable {
-            seq: 4,
-            table_id: 42,
-            level: 1,
         };
 
         let encoded = original.encode();

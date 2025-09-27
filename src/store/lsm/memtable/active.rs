@@ -1,5 +1,5 @@
 use super::super::wal::Wal;
-use super::{core::Memtable, core::ScanIter, frozen::FrozenMemtable};
+use super::{core::Memtable, core::ScanIterator, frozen::FrozenMemtable};
 use crate::error::Result;
 use std::{
     ops::RangeBounds,
@@ -60,7 +60,10 @@ impl ActiveMemtable {
         self.wal.write().unwrap().flush()
     }
 
-    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter> {
+    pub fn scan<R>(&self, range: R) -> Result<ScanIterator<R>>
+    where
+        R: RangeBounds<Vec<u8>> + Clone + Send + Sync,
+    {
         self.memtable.scan(range)
     }
 

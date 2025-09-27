@@ -137,7 +137,6 @@ impl Manifest {
                     seq,
                     levels,
                     next_table_id,
-                    deletable_wals,
                 } => {
                     state.levels.clear();
                     for level_meta in levels {
@@ -150,11 +149,14 @@ impl Manifest {
                         state.levels[level_meta.level as usize] = level_meta.clone();
                     }
                     state.next_table_id = next_table_id;
-                    state.deletable_wals = deletable_wals;
                     last_snapshot_seq = Some(seq);
                 }
 
-                VersionEdit::Flush { seq, table, wal_id } => {
+                VersionEdit::Flush {
+                    seq,
+                    table,
+                    wal_id: _,
+                } => {
                     if let Some(snap_seq) = last_snapshot_seq {
                         if seq <= snap_seq {
                             continue;
@@ -163,7 +165,6 @@ impl Manifest {
                     let table_id = table.id;
                     let level = table.level;
                     state.add_table_at_level(table, level);
-                    state.deletable_wals.push(wal_id);
                     state.next_table_id = state.next_table_id.max(table_id + 1);
                 }
 
@@ -188,30 +189,6 @@ impl Manifest {
                         state.add_table_at_level(table, target_level);
                     }
                 }
-
-                VersionEdit::AddSSTable { seq, level, table } => {
-                    if let Some(snap_seq) = last_snapshot_seq {
-                        if seq <= snap_seq {
-                            continue;
-                        }
-                    }
-                    let table_id = table.id;
-                    state.add_table_at_level(table, level);
-                    state.next_table_id = state.next_table_id.max(table_id + 1);
-                }
-
-                VersionEdit::DeleteSSTable {
-                    seq,
-                    table_id,
-                    level,
-                } => {
-                    if let Some(snap_seq) = last_snapshot_seq {
-                        if seq <= snap_seq {
-                            continue;
-                        }
-                    }
-                    state.delete_tables(level, &[table_id]);
-                }
             }
         }
 
@@ -225,7 +202,6 @@ use meta::LevelMeta;
 pub struct ManifestState {
     pub levels: Vec<LevelMeta>,
     pub next_table_id: u64,
-    pub deletable_wals: Vec<u64>,
 }
 
 impl Default for ManifestState {
@@ -239,7 +215,6 @@ impl ManifestState {
         Self {
             levels: Vec::new(),
             next_table_id: 0,
-            deletable_wals: Vec::new(),
         }
     }
 
@@ -397,7 +372,6 @@ mod tests {
                 tables: vec![create_test_table_meta(1)],
             }],
             next_table_id: 10,
-            deletable_wals: vec![1, 2, 3],
         };
 
         manifest.append(snapshot.clone())?;
@@ -422,15 +396,10 @@ mod tests {
                 table: create_test_table_meta(0),
                 wal_id: 1,
             },
-            VersionEdit::AddSSTable {
+            VersionEdit::Flush {
                 seq: manifest.next_seq(),
-                level: 1,
                 table: create_test_table_meta(1),
-            },
-            VersionEdit::DeleteSSTable {
-                seq: manifest.next_seq(),
-                table_id: 0,
-                level: 0,
+                wal_id: 2,
             },
         ];
 
@@ -488,7 +457,6 @@ mod tests {
 
         let state = manifest.replay()?;
         assert_eq!(state.next_table_id, 2);
-        assert_eq!(state.deletable_wals, vec![1, 2]);
         assert_eq!(state.levels.len(), 1);
         assert_eq!(state.levels[0].tables.len(), 2);
 
@@ -501,15 +469,15 @@ mod tests {
         let manifest_path = dir.path().join("MANIFEST");
         let manifest = Manifest::new(&manifest_path)?;
 
-        manifest.append(VersionEdit::AddSSTable {
+        manifest.append(VersionEdit::Flush {
             seq: manifest.next_seq(),
-            level: 0,
             table: create_test_table_meta(0),
+            wal_id: 1,
         })?;
-        manifest.append(VersionEdit::AddSSTable {
+        manifest.append(VersionEdit::Flush {
             seq: manifest.next_seq(),
-            level: 0,
             table: create_test_table_meta(1),
+            wal_id: 2,
         })?;
 
         manifest.append(VersionEdit::BeginCompaction {
@@ -544,15 +512,15 @@ mod tests {
         let manifest_path = dir.path().join("MANIFEST");
         let manifest = Manifest::new(&manifest_path)?;
 
-        manifest.append(VersionEdit::AddSSTable {
+        manifest.append(VersionEdit::Flush {
             seq: manifest.next_seq(),
-            level: 0,
             table: create_test_table_meta(0),
+            wal_id: 1,
         })?;
-        manifest.append(VersionEdit::AddSSTable {
+        manifest.append(VersionEdit::Flush {
             seq: manifest.next_seq(),
-            level: 0,
             table: create_test_table_meta(1),
+            wal_id: 2,
         })?;
 
         manifest.append(VersionEdit::Snapshot {
@@ -562,19 +530,17 @@ mod tests {
                 tables: vec![create_test_table_meta(5)],
             }],
             next_table_id: 10,
-            deletable_wals: vec![3, 4],
         })?;
 
-        manifest.append(VersionEdit::AddSSTable {
+        manifest.append(VersionEdit::Flush {
             seq: manifest.next_seq(),
-            level: 0,
             table: create_test_table_meta(10),
+            wal_id: 5,
         })?;
         manifest.sync()?;
 
         let state = manifest.replay()?;
         assert_eq!(state.next_table_id, 11);
-        assert_eq!(state.deletable_wals, vec![3, 4]);
         assert_eq!(state.levels[0].tables.len(), 1);
         assert_eq!(state.levels[0].tables[0].id, 10);
         assert_eq!(state.levels[1].tables.len(), 1);
@@ -589,10 +555,10 @@ mod tests {
         let manifest_path = dir.path().join("MANIFEST");
         let manifest = Manifest::new(&manifest_path)?;
 
-        manifest.append(VersionEdit::AddSSTable {
+        manifest.append(VersionEdit::Flush {
             seq: manifest.next_seq(),
-            level: 0,
             table: create_test_table_meta(0),
+            wal_id: 1,
         })?;
 
         manifest.append(VersionEdit::BeginCompaction {
@@ -606,6 +572,264 @@ mod tests {
         let state = manifest.replay()?;
         assert_eq!(state.levels[0].tables.len(), 1);
         assert_eq!(state.levels[0].tables[0].id, 0);
+
+        Ok(())
+    }
+
+    // ===== MANIFEST CORRUPTION AND RECOVERY TESTS =====
+    // Tests that ensure proper handling of corrupted manifest files
+
+    #[test]
+    fn test_manifest_partial_corruption_recovery() -> Result<()> {
+        let dir = TempDir::new()?;
+        let manifest_path = dir.path().join("MANIFEST");
+
+        // Create a manifest with some valid entries
+        {
+            let manifest = Manifest::new(&manifest_path)?;
+            manifest.append(VersionEdit::Flush {
+                seq: manifest.next_seq(),
+                table: create_test_table_meta(0),
+                wal_id: 1,
+            })?;
+            manifest.append(VersionEdit::Flush {
+                seq: manifest.next_seq(),
+                table: create_test_table_meta(1),
+                wal_id: 2,
+            })?;
+            manifest.sync()?;
+        }
+
+        // Corrupt the manifest by truncating it in the middle
+        {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&manifest_path)?;
+            let original_len = file.metadata()?.len();
+            // Truncate to remove part of the second record
+            file.set_len(original_len - 10)?;
+        }
+
+        // Attempt to read the corrupted manifest
+        let manifest = Manifest::new(&manifest_path)?;
+        let result = manifest.replay();
+
+        // Should recover the first valid entry but fail gracefully on corruption
+        match result {
+            Ok(state) => {
+                // If recovery succeeds, should have recovered the first entry
+                assert_eq!(state.levels.len(), 1);
+                assert_eq!(state.levels[0].tables.len(), 1);
+                assert_eq!(state.next_table_id, 1);
+            }
+            Err(_) => {
+                // Recovery may fail, which is also acceptable for corrupted data
+                // The important thing is it doesn't panic or leave the system in a bad state
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_manifest_checksum_corruption() -> Result<()> {
+        let dir = TempDir::new()?;
+        let manifest_path = dir.path().join("MANIFEST");
+
+        // Create a manifest with valid entries
+        {
+            let manifest = Manifest::new(&manifest_path)?;
+            manifest.append(VersionEdit::Flush {
+                seq: manifest.next_seq(),
+                table: create_test_table_meta(0),
+                wal_id: 1,
+            })?;
+            manifest.sync()?;
+        }
+
+        // Corrupt the checksum by modifying the last few bytes
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&manifest_path)?;
+            use std::io::{Seek, SeekFrom, Write};
+            file.seek(SeekFrom::End(-4))?; // Go to last 4 bytes (checksum)
+            file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])?; // Corrupt checksum
+        }
+
+        // Try to read the manifest with corrupted checksum
+        let manifest = Manifest::new(&manifest_path)?;
+        let mut iter = manifest.iter()?;
+
+        // Should detect checksum corruption
+        let result = iter.next();
+        match result {
+            Some(Err(Error::ChecksumMismatch)) => {
+                // Expected: checksum mismatch detected
+            }
+            Some(Ok(_)) => {
+                panic!("Should have detected checksum corruption");
+            }
+            Some(Err(other)) => {
+                panic!("Expected checksum mismatch, got: {:?}", other);
+            }
+            None => {
+                panic!("Should have at least one entry");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_manifest_empty_after_header() -> Result<()> {
+        let dir = TempDir::new()?;
+        let manifest_path = dir.path().join("MANIFEST");
+
+        // Create manifest and immediately close it (only header written)
+        {
+            let _manifest = Manifest::new(&manifest_path)?;
+            // Manifest is closed with only header
+        }
+
+        // Reopen and verify it's handled correctly
+        let manifest = Manifest::new(&manifest_path)?;
+        let state = manifest.replay()?;
+
+        // Should be empty state but valid
+        assert!(state.levels.is_empty());
+        assert_eq!(state.next_table_id, 0);
+
+        // Should be able to append new entries
+        manifest.append(VersionEdit::Flush {
+            seq: manifest.next_seq(),
+            table: create_test_table_meta(0),
+            wal_id: 1,
+        })?;
+        manifest.sync()?;
+
+        let state_after = manifest.replay()?;
+        assert_eq!(state_after.levels.len(), 1);
+        assert_eq!(state_after.levels[0].tables.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_manifest_recovery_with_mixed_corruption() -> Result<()> {
+        let dir = TempDir::new()?;
+        let manifest_path = dir.path().join("MANIFEST");
+
+        // Create manifest with several entries
+        {
+            let manifest = Manifest::new(&manifest_path)?;
+
+            // Add several valid entries
+            for i in 0..5 {
+                manifest.append(VersionEdit::Flush {
+                    seq: manifest.next_seq(),
+                    table: create_test_table_meta(i),
+                    wal_id: i + 1,
+                })?;
+            }
+            manifest.sync()?;
+        }
+
+        // Corrupt the middle of the file by writing garbage
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&manifest_path)?;
+            use std::io::{Seek, SeekFrom, Write};
+
+            let file_len = file.metadata()?.len();
+            let corrupt_pos = file_len / 2; // Corrupt middle of file
+            file.seek(SeekFrom::Start(corrupt_pos))?;
+            file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?; // Write garbage
+        }
+
+        // Try to recover what we can
+        let manifest = Manifest::new(&manifest_path)?;
+        let result = manifest.replay();
+
+        match result {
+            Ok(state) => {
+                // If recovery succeeds, should have some entries (before corruption)
+                assert!(!state.levels.is_empty());
+                // May not have all 5 entries due to corruption
+            }
+            Err(_) => {
+                // Recovery may fail due to corruption - acceptable
+                // Test ensures system doesn't crash or panic
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_manifest_invalid_edit_type() -> Result<()> {
+        let dir = TempDir::new()?;
+        let manifest_path = dir.path().join("MANIFEST");
+
+        // Create a valid manifest first
+        {
+            let manifest = Manifest::new(&manifest_path)?;
+            manifest.append(VersionEdit::Flush {
+                seq: manifest.next_seq(),
+                table: create_test_table_meta(0),
+                wal_id: 1,
+            })?;
+            manifest.sync()?;
+        }
+
+        // Manually append an invalid edit type
+        {
+            use byteorder::{BigEndian, WriteBytesExt};
+            use std::fs::OpenOptions;
+            use std::io::Write;
+
+            let mut file = OpenOptions::new().append(true).open(&manifest_path)?;
+
+            // Write an invalid edit (unknown type)
+            let invalid_edit = vec![0xFF]; // Invalid edit type
+            let checksum = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(&invalid_edit);
+
+            file.write_u32::<BigEndian>(invalid_edit.len() as u32)?;
+            file.write_all(&invalid_edit)?;
+            file.write_u32::<BigEndian>(checksum)?;
+        }
+
+        // Try to replay manifest with invalid edit
+        let manifest = Manifest::new(&manifest_path)?;
+        let mut iter = manifest.iter()?;
+
+        // First entry should be valid
+        let first = iter.next().unwrap()?;
+        match first {
+            VersionEdit::Flush { .. } => {
+                // Expected first entry
+            }
+            _ => panic!("Expected flush edit"),
+        }
+
+        // Second entry should be invalid
+        let second = iter.next();
+        match second {
+            Some(Err(Error::InvalidEditType(0xFF))) => {
+                // Expected: invalid edit type detected
+            }
+            Some(Ok(_)) => {
+                panic!("Should have rejected invalid edit type");
+            }
+            Some(Err(other)) => {
+                panic!("Expected invalid edit type error, got: {:?}", other);
+            }
+            None => {
+                panic!("Should have found the invalid entry");
+            }
+        }
 
         Ok(())
     }

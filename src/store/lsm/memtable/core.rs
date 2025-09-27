@@ -1,11 +1,12 @@
+use super::super::filter::RangeFilter;
 use super::super::sstable::{block, table};
 use super::super::wal::Wal;
 use crate::error::Result;
 use crate::Error;
-use crossbeam_skiplist::{map::Entry, SkipMap};
+use crossbeam_skiplist::SkipMap;
 use std::sync::{Arc, RwLock};
 use std::{
-    ops::{Bound, RangeBounds},
+    ops::RangeBounds,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -16,6 +17,18 @@ pub struct Memtable {
     wal_id: u64,
     size: AtomicUsize,
     frozen: AtomicBool,
+}
+
+impl Clone for Memtable {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            wal: self.wal.clone(),
+            wal_id: self.wal_id,
+            size: AtomicUsize::new(self.size.load(Ordering::SeqCst)),
+            frozen: AtomicBool::new(self.frozen.load(Ordering::SeqCst)),
+        }
+    }
 }
 
 impl Memtable {
@@ -103,25 +116,12 @@ impl Memtable {
     }
 
     // Scan range of keys
-    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<ScanIter> {
-        // Extract start and end bounds from the range
-        let start = match range.start_bound() {
-            std::ops::Bound::Included(key) => std::ops::Bound::Included(key.clone()),
-            std::ops::Bound::Excluded(key) => std::ops::Bound::Excluded(key.clone()),
-            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
-        };
-
-        let end = match range.end_bound() {
-            std::ops::Bound::Included(key) => std::ops::Bound::Included(key.clone()),
-            std::ops::Bound::Excluded(key) => std::ops::Bound::Excluded(key.clone()),
-            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
-        };
-
-        // Create a Range with explicit bounds
-        let skipmap_range = self.data.range((start, end));
-        Ok(ScanIter {
-            inner: skipmap_range,
-        })
+    pub fn scan<R>(&self, range: R) -> Result<ScanIterator<R>>
+    where
+        R: RangeBounds<Vec<u8>> + Clone + Send + Sync,
+    {
+        let memtable_iter = MemtableIterator::new(Arc::new(self.clone()));
+        Ok(RangeFilter::new(memtable_iter, range))
     }
 
     // sync synchronizes the Memtable's WAL.
@@ -182,34 +182,62 @@ impl Memtable {
     }
 }
 
-type SkipMapRange<'a> = crossbeam_skiplist::map::Range<
-    'a,
-    Vec<u8>,
-    (Bound<Vec<u8>>, Bound<Vec<u8>>),
-    Vec<u8>,
-    Option<Vec<u8>>,
->;
-
-pub struct ScanIter<'a> {
-    inner: SkipMapRange<'a>,
+/// Pure memtable iterator that lazily iterates over all entries (like BlockIterator)
+pub struct MemtableIterator {
+    memtable: Arc<Memtable>,
+    current_key: Option<Vec<u8>>,
+    exhausted: bool,
 }
 
-impl ScanIter<'_> {
-    /// Maps a SkipMap Entry to the expected output format.
-    fn map(entry: Entry<'_, Vec<u8>, Option<Vec<u8>>>) -> <Self as Iterator>::Item {
-        let key = entry.key();
-        let value = entry.value();
-        Ok((key.clone(), value.clone().unwrap_or_default()))
+impl MemtableIterator {
+    pub fn new(memtable: Arc<Memtable>) -> Self {
+        Self {
+            memtable,
+            current_key: None,
+            exhausted: false,
+        }
     }
 }
 
-impl Iterator for ScanIter<'_> {
+impl Iterator for MemtableIterator {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Self::map)
+        if self.exhausted {
+            return None;
+        }
+
+        // Create a range starting from current_key
+        let range = match &self.current_key {
+            Some(key) => {
+                use std::ops::Bound;
+                (Bound::Excluded(key.clone()), Bound::Unbounded)
+            }
+            None => {
+                use std::ops::Bound;
+                (Bound::Unbounded, Bound::Unbounded)
+            }
+        };
+
+        // Get next entry using a fresh SkipMap range
+        let mut range_iter = self.memtable.data.range(range);
+        match range_iter.next() {
+            Some(entry) => {
+                let key = entry.key().clone();
+                let value = entry.value().clone().unwrap_or_default();
+                self.current_key = Some(key.clone());
+                Some(Ok((key, value)))
+            }
+            None => {
+                self.exhausted = true;
+                None
+            }
+        }
     }
 }
+
+/// Range-filtered memtable scan iterator (like SSTable's ScanIterator)
+pub type ScanIterator<R> = RangeFilter<MemtableIterator, R>;
 
 #[cfg(test)]
 mod tests {

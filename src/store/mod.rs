@@ -3,11 +3,11 @@ pub mod lsm;
 use crate::error::Result;
 use std::ops::RangeBounds;
 
-pub trait Store {
+pub trait Store: Send + Sync {
     /// The iterator returned by scan().
     type ScanIterator<'a>: ScanIterator + 'a
     where
-        Self: 'a;
+        Self: Sized + 'a; // omit in trait objects, for dyn compatibility
 
     /// Inserts or updates a key-value pair.
     fn set(&self, key: &[u8], value: Vec<u8>) -> Result<()>;
@@ -16,10 +16,21 @@ pub trait Store {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Iterates over an ordered range of key-value pairs.
-    fn scan<'a>(&'a self, range: impl RangeBounds<Vec<u8>> + 'a + Clone) -> Self::ScanIterator<'a>;
+    fn scan<'a>(
+        &'a self,
+        range: impl RangeBounds<Vec<u8>> + Clone + Send + Sync + 'a,
+    ) -> Self::ScanIterator<'a>
+    where
+        Self: Sized; // omit in trait objects, for dyn compatibility
+
+    // /// Like scan, but can be used from trait objects (with dynamic dispatch).
+    // fn scan_dyn<'a>(&'a self, range: (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>)) -> Box<dyn ScanIterator + 'a>;
 
     /// Iterates over all key-value pairs starting with the given prefix.
-    fn scan_prefix<'a>(&'a self, prefix: &'a [u8]) -> Self::ScanIterator<'a> {
+    fn scan_prefix<'a>(&'a self, prefix: &'a [u8]) -> Self::ScanIterator<'a>
+    where
+        Self: Sized, // omit in trait objects, for dyn compatibility
+    {
         let start = std::ops::Bound::Included(prefix.to_vec());
         let end = match prefix.iter().rposition(|b| *b != 0xff) {
             Some(i) => std::ops::Bound::Excluded(
@@ -34,8 +45,9 @@ pub trait Store {
         self.scan((start, end))
     }
 
-    /// Flushes any pending writes to disk.
-    fn flush(&self) -> Result<()>;
+    /// Synchronizes buffered WAL writes to disk. Writes (set operations) are not
+    /// guaranteed to be durable until this is called.
+    fn sync(&self) -> Result<()>;
 }
 
 pub trait ScanIterator: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}

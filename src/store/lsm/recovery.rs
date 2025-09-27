@@ -25,14 +25,42 @@ pub(crate) fn recover_state(config: &LsmConfig) -> Result<LsmState> {
     // Recover memtables from WAL
     let (active_memtable, frozen_memtables, next_wal_id) = recover_memtables(dir)?;
 
-    Ok(LsmState::new(
+    let state = LsmState::new(
         active_memtable,
         frozen_memtables,
         levels,
         manifest,
         manifest_state.next_table_id,
         next_wal_id,
-    ))
+    );
+
+    // Validate state consistency after recovery
+    if let Err(e) = state.validate_consistency() {
+        tracing::error!("Database corruption detected during recovery: {:?}", e);
+        return Err(crate::Error::InvalidState(format!(
+            "Database recovery failed validation: {}",
+            e
+        )));
+    }
+
+    // Debug-only comprehensive validation
+    #[cfg(debug_assertions)]
+    {
+        if let Err(e) = state.validate_sstable_id_uniqueness() {
+            tracing::error!("SSTable ID uniqueness validation failed: {:?}", e);
+            return Err(e);
+        }
+
+        if let Err(e) = state.validate_level_key_ordering() {
+            tracing::error!("Level key ordering validation failed: {:?}", e);
+            return Err(e);
+        }
+
+        tracing::debug!("Comprehensive state validation passed during recovery");
+    }
+
+    tracing::info!("Database recovery completed successfully with validation");
+    Ok(state)
 }
 
 /// Convert manifest state to levels
@@ -45,7 +73,7 @@ fn levels_from_manifest_state(dir: &Path, state: &ManifestState) -> Result<Vec<L
         }
 
         for table_meta in &level_meta.tables {
-            let path = dir.join(format!("{}.sst", table_meta.id));
+            let path = dir.join("sst").join(format!("{:08}.sst", table_meta.id));
             let table = Table::readable(path.to_str().unwrap())?;
             levels[level_meta.level as usize].add_sstable(SSTable {
                 id: table_meta.id,
@@ -87,7 +115,6 @@ mod tests {
         let manifest_state = ManifestState {
             levels: Vec::new(),
             next_table_id: 0,
-            deletable_wals: Vec::new(),
         };
 
         let levels = levels_from_manifest_state(temp_dir.path(), &manifest_state)?;

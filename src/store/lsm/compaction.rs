@@ -1,10 +1,7 @@
 use super::{Level, LsmState, SSTable};
-use crate::{
-    config::{CompactionConfig, LsmConfig},
-    error::Result,
-};
+use crate::{config::CompactionConfig, error::Result};
 
-use super::iterator::{KvIterator, MergeIterator};
+use super::iterator::{LSMIterator, LSMScanIterator};
 
 /// Check if compaction is needed
 pub fn needs_compaction(state: &LsmState, config: &CompactionConfig) -> bool {
@@ -65,7 +62,9 @@ pub fn find_compaction_level(state: &LsmState, config: &CompactionConfig) -> Opt
 }
 
 /// Perform tiered compaction if needed
-pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
+pub async fn compact(store: &super::LsmStore) -> Result<()> {
+    let state = &store.state;
+    let config = &store.config;
     let _guard = state.start_compaction();
 
     // Find which level needs compaction
@@ -106,16 +105,15 @@ pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
                 .ok_or_else(|| crate::Error::InvalidOperation("SSTable not found".to_string()))?;
 
             let scan_iter = sstable.table.scan(..)?;
-            let boxed_iter: KvIterator = Box::new(scan_iter);
+            let boxed_iter: LSMIterator = Box::new(scan_iter);
             iterators.push(boxed_iter);
         }
     }
 
     // 2. Create merge iterator and write to new SSTable
-    let merge_iter = MergeIterator::new(iterators);
+    let merge_iter = LSMScanIterator::new(iterators);
 
-    let table_id = state.next_sstable_id();
-    let table_path = config.dir.join(format!("{}.sst", table_id));
+    let (table_id, table_path) = store.next_sstable_path();
     let mut writable_table = super::sstable::table::Table::writable(table_path.to_str().unwrap())?;
 
     let mut builder = super::sstable::block::Builder::new();
@@ -221,7 +219,7 @@ pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
 
     // 6. Delete old SSTable files
     for table_id in &source_table_ids {
-        let old_path = config.dir.join(format!("{}.sst", table_id));
+        let old_path = store.sstable_path(*table_id);
         if let Err(e) = std::fs::remove_file(&old_path) {
             tracing::warn!(table_id = table_id, error = %e, "Failed to delete old SSTable file");
         }
@@ -236,5 +234,419 @@ pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
         "Completed tiered compaction"
     );
 
+    // Validate state consistency after compaction
+    if let Err(e) = store.state.validate_consistency() {
+        tracing::warn!("State inconsistency detected after compaction: {:?}", e);
+    }
+
+    // Debug-only comprehensive validation
+    #[cfg(debug_assertions)]
+    {
+        if let Err(e) = store.state.validate_sstable_id_uniqueness() {
+            tracing::error!("SSTable ID uniqueness violation after compaction: {:?}", e);
+        }
+
+        if let Err(e) = store.state.validate_level_key_ordering() {
+            tracing::error!("Level key ordering violation after compaction: {:?}", e);
+        }
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        config::{CompactionConfig, LsmConfig},
+        error::Result,
+        store::Store,
+        tmpfs::TempDir,
+    };
+    use std::time::Duration;
+
+    // Helper function to create a test store with custom config
+    fn create_test_store_with_config(
+        temp_dir: &TempDir,
+        config: CompactionConfig,
+    ) -> super::super::LsmStore {
+        let lsm_config = LsmConfig::new(temp_dir.path()).compaction(config);
+        super::super::LsmStore::open_with_config(lsm_config).expect("Failed to create store")
+    }
+
+    // Helper function to create a test store with default aggressive compaction settings
+    fn create_test_store(temp_dir: &TempDir) -> super::super::LsmStore {
+        let compaction_config = CompactionConfig::default()
+            .level0_compaction_threshold(2) // Lower threshold for easier testing
+            .size_ratio_threshold(2) // Lower ratio for easier testing
+            .max_tables_per_level(3); // Lower max for easier testing
+
+        create_test_store_with_config(temp_dir, compaction_config)
+    }
+
+    // Helper to populate data that will create multiple SSTables
+    async fn populate_multiple_tables(
+        store: &super::super::LsmStore,
+        table_count: usize,
+    ) -> Result<()> {
+        let entries_per_table = 100;
+
+        for table_idx in 0..table_count {
+            for i in 0..entries_per_table {
+                let key = format!("key_{:03}_{:03}", table_idx, i);
+                let value = format!("value_{}", i);
+                store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+            }
+
+            // Force freeze of active memtable to create a frozen memtable
+            store.freeze_active_memtable()?;
+
+            // Manually flush the frozen memtable to create SSTable
+            while store.flush_memtable().await? {
+                // Keep flushing until no more frozen memtables
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        Ok(())
+    }
+
+    // Helper to verify data integrity after compaction
+    fn verify_data_integrity(
+        store: &super::super::LsmStore,
+        expected_entries: usize,
+    ) -> Result<()> {
+        let mut count = 0;
+        let mut last_key = None;
+
+        for entry in store.scan(..) {
+            let (key, _value) = entry?;
+
+            // Verify key ordering
+            if let Some(ref last) = last_key {
+                assert!(
+                    key > *last,
+                    "Keys not in order: {:?} should be > {:?}",
+                    key,
+                    last
+                );
+            }
+            last_key = Some(key);
+            count += 1;
+        }
+
+        assert_eq!(
+            count, expected_entries,
+            "Expected {} entries, found {}",
+            expected_entries, count
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_basic_l0_to_l1_compaction() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Create multiple L0 tables (exceeding threshold of 2)
+        populate_multiple_tables(&store, 3).await?;
+
+        // Verify we have tables at L0
+        {
+            let levels = store.state.levels.read().unwrap();
+            assert!(!levels.is_empty(), "Expected L0 to have tables");
+            assert!(
+                levels[0].table_count() >= 3,
+                "Expected at least 3 L0 tables"
+            );
+        }
+
+        // Trigger compaction directly on the store
+        store.compact().await?;
+
+        // Verify compaction result
+        {
+            let levels = store.state.levels.read().unwrap();
+            assert!(
+                levels.len() >= 2,
+                "Expected at least 2 levels after compaction"
+            );
+
+            // L0 should be empty or have fewer tables
+            assert!(
+                levels[0].table_count() <= store.config.compaction.level0_compaction_threshold,
+                "L0 should have <= threshold tables after compaction"
+            );
+
+            // L1 should have tables
+            assert!(
+                levels[1].table_count() > 0,
+                "L1 should have tables after compaction"
+            );
+        }
+
+        // Verify data integrity
+        verify_data_integrity(&store, 300)?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multi_level_compaction() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Create data that will populate multiple levels
+        populate_multiple_tables(&store, 8).await?;
+
+        // Run multiple compaction rounds to build up levels
+        for _ in 0..5 {
+            store.compact().await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Verify we have multiple levels
+        {
+            let levels = store.state.levels.read().unwrap();
+            assert!(levels.len() >= 2, "Expected multiple levels");
+
+            // Should have some distribution across levels
+            let total_tables: usize = levels.iter().map(|l| l.table_count()).sum();
+            assert!(total_tables > 0, "Should have tables in levels");
+        }
+
+        // Verify data integrity
+        verify_data_integrity(&store, 800)?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlapping_keys_compaction() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Create overlapping keys across multiple tables (newer should win)
+        for table_idx in 0..3 {
+            for i in 0..50 {
+                let key = format!("key_{:03}", i); // Same keys across tables
+                let value = format!("value_{}_{}", table_idx, i); // Different values
+                store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+            }
+
+            // Force flush using public API
+            store.freeze_active_memtable()?;
+            while store.flush_memtable().await? {
+                // Keep flushing until no more frozen memtables
+            }
+        }
+
+        // Compact
+        store.compact().await?;
+
+        // Verify only the latest values are present
+        for i in 0..50 {
+            let key = format!("key_{:03}", i);
+            let expected_value = format!("value_2_{}", i); // Latest write (table_idx=2)
+
+            if let Some(actual_value) = store.get(key.as_bytes())? {
+                assert_eq!(
+                    actual_value,
+                    expected_value.as_bytes(),
+                    "Key {} should have latest value",
+                    key
+                );
+            } else {
+                panic!("Key {} should be present", key);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compaction_with_boundary_config() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Test with very aggressive settings
+        let aggressive_config = CompactionConfig::default()
+            .level0_compaction_threshold(1)
+            .size_ratio_threshold(1)
+            .max_tables_per_level(1);
+
+        let store = create_test_store_with_config(&temp_dir, aggressive_config);
+
+        // Add some data
+        populate_multiple_tables(&store, 2).await?;
+
+        // Should need compaction immediately
+        assert!(
+            store.needs_compaction(),
+            "Should need compaction with aggressive config"
+        );
+
+        // Run compaction
+        store.compact().await?;
+
+        // Verify data integrity
+        verify_data_integrity(&store, 200)?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_compaction_prevention() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Start a compaction guard manually to simulate running compaction
+        let _guard = store.state.start_compaction();
+
+        // Should not need compaction while one is running
+        assert!(
+            !store.needs_compaction(),
+            "Should not need compaction when one is running"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_empty_tables_compaction() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Create tables with minimal data
+        for i in 0..3 {
+            let key = format!("key_{}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+
+            // Force flush to create individual tables using public API
+            store.freeze_active_memtable()?;
+            while store.flush_memtable().await? {
+                // Keep flushing until no more frozen memtables
+            }
+        }
+
+        // Compact
+        store.compact().await?;
+
+        // Verify all data is still accessible
+        for i in 0..3 {
+            let key = format!("key_{}", i);
+            assert!(
+                store.get(key.as_bytes())?.is_some(),
+                "Key {} should be present",
+                key
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compaction_no_op_when_not_needed() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Add minimal data (below compaction thresholds)
+        store.set(b"key1", b"value1".to_vec())?;
+
+        // Force flush but don't exceed L0 threshold using public API
+        store.freeze_active_memtable()?;
+        while store.flush_memtable().await? {
+            // Keep flushing until no more frozen memtables
+        }
+
+        // Record initial state
+        let initial_table_count = {
+            let levels = store.state.levels.read().unwrap();
+            levels.first().map(|l| l.table_count()).unwrap_or(0)
+        };
+
+        // Attempt compaction - should be no-op
+        store.compact().await?;
+
+        // Verify no changes occurred
+        {
+            let levels = store.state.levels.read().unwrap();
+            let current_table_count = levels.first().map(|l| l.table_count()).unwrap_or(0);
+
+            assert_eq!(
+                initial_table_count, current_table_count,
+                "Table count should not change when compaction is not needed"
+            );
+
+            // Should still only have L0
+            assert!(
+                levels.len() <= 1,
+                "Should not create additional levels when compaction not needed"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_manual_compaction_cycle() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Initially should not need compaction
+        assert!(
+            !store.needs_compaction(),
+            "Fresh store should not need compaction"
+        );
+
+        // Create multiple SSTables to trigger compaction need
+        for table_idx in 0..4 {
+            // Exceed our threshold of 2
+            for i in 0..20 {
+                let key = format!("table_{}_key_{:03}", table_idx, i);
+                let value = format!("value_{}", i);
+                store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+            }
+
+            // Create SSTable using public API
+            store.freeze_active_memtable()?;
+            let flushed = store.flush_memtable().await?;
+            assert!(flushed, "Should have flushed memtable {}", table_idx);
+        }
+
+        // Now should need compaction
+        assert!(
+            store.needs_compaction(),
+            "Should need compaction after creating multiple SSTables"
+        );
+
+        // Manual compaction using public API
+        store.compact().await?;
+
+        // Should no longer need compaction (or need less)
+        let compaction_reduced = !store.needs_compaction() || {
+            // If still needs compaction, verify structure improved
+            let levels = store.state.levels.read().unwrap();
+            levels.len() >= 2 && levels[1].table_count() > 0
+        };
+        assert!(
+            compaction_reduced,
+            "Compaction should reduce need or create multi-level structure"
+        );
+
+        // Verify all data is still accessible
+        for table_idx in 0..4 {
+            for i in 0..20 {
+                let key = format!("table_{}_key_{:03}", table_idx, i);
+                let value = store.get(key.as_bytes())?;
+                assert!(
+                    value.is_some(),
+                    "Key {} should be accessible after compaction",
+                    key
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
