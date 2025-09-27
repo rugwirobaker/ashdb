@@ -1,7 +1,8 @@
-//! Iterator filtering utilities for SSTable data.
+//! Iterator filtering utilities for LSM tree components.
 //!
 //! This module provides generic iterator adapters that can filter and transform
-//! streams of key-value pairs based on various criteria.
+//! streams of key-value pairs based on various criteria. These utilities are shared
+//! across all LSM components including memtables, SSTables, and merge iterators.
 
 use crate::error::Result;
 use std::ops::{Bound, RangeBounds};

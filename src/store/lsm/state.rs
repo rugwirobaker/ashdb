@@ -8,6 +8,7 @@ use std::{
 
 use super::memtable::{ActiveMemtable, FrozenMemtable};
 use super::{manifest::Manifest, Level};
+use crate::error::Result;
 
 /// All mutable state for the LSM store with fine-grained locking
 pub struct LsmState {
@@ -244,6 +245,78 @@ impl LsmState {
         }
 
         Ok(())
+    }
+
+    /// Get current health metrics for monitoring and debugging
+    pub fn get_health_metrics(&self) -> StateMetrics {
+        self.get_state_metrics()
+    }
+
+    /// Comprehensive validation for debug builds and testing
+    #[cfg(debug_assertions)]
+    pub fn validate_comprehensive(&self) -> Result<()> {
+        tracing::debug!("Starting comprehensive validation");
+
+        // Basic consistency validation
+        self.validate_consistency()?;
+
+        // SSTable ID uniqueness validation
+        self.validate_sstable_id_uniqueness()?;
+
+        // Level key ordering validation
+        self.validate_level_key_ordering()?;
+
+        tracing::debug!("Comprehensive validation passed");
+        Ok(())
+    }
+
+    /// Run periodic health check with validation (renamed from health_check)
+    pub fn status(&self) -> Result<StateMetrics> {
+        let metrics = self.get_health_metrics();
+
+        // Log health metrics
+        tracing::info!(
+            "LSM Health Check - levels: {}, tables: {}, active_size: {}, frozen: {}, operations: compaction={}, freeze={}, flush={}",
+            metrics.level_count,
+            metrics.total_sstable_count,
+            metrics.active_memtable_size,
+            metrics.frozen_memtable_count,
+            metrics.compaction_running,
+            metrics.freeze_in_progress,
+            metrics.flush_pending
+        );
+
+        // Warn about potential issues
+        if metrics.compaction_running > 2 {
+            tracing::warn!(
+                "Multiple compactions running: {}",
+                metrics.compaction_running
+            );
+        }
+
+        if metrics.frozen_memtable_count > 10 {
+            tracing::warn!(
+                "High number of frozen memtables: {}",
+                metrics.frozen_memtable_count
+            );
+        }
+
+        // Basic consistency check in production
+        if let Err(e) = self.validate_consistency() {
+            tracing::error!("Health check detected inconsistency: {:?}", e);
+            return Err(e);
+        }
+
+        // Comprehensive validation in debug builds
+        #[cfg(debug_assertions)]
+        {
+            if let Err(e) = self.validate_comprehensive() {
+                tracing::error!("Comprehensive health check failed: {:?}", e);
+                return Err(e);
+            }
+        }
+
+        Ok(metrics)
     }
 }
 

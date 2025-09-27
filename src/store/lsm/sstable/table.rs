@@ -27,8 +27,8 @@
 //! The `Table` enum represents an SSTable and can be in one of two states:
 //! `Writable` for building a new table, or `Readable` for querying an existing one.
 //!
+use super::super::filter::RangeFilter;
 use super::block::{Block, MultiBlockIterator};
-use super::filter::RangeFilter;
 use super::index::Index;
 use crate::error::Result;
 use crate::Error;

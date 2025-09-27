@@ -1,4 +1,5 @@
 pub mod compaction;
+pub mod filter;
 pub mod flush;
 pub mod iterator;
 pub mod level;
@@ -12,13 +13,13 @@ pub mod store;
 pub mod wal;
 
 // Re-export iterator types for use by the main LSM store
-pub use iterator::{HeapEntry, KvIterator, MergeIterator, OwningMemtableIter};
+pub use iterator::{HeapEntry, LSMIterator, LSMScanIterator};
 
 // Re-export level types
 pub use level::{Level, SSTable};
 
 // Re-export memtable types
-pub use memtable::{ActiveMemtable, FrozenMemtable, Memtable, ScanIter, MAX_MEMTABLE_SIZE};
+pub use memtable::{ActiveMemtable, FrozenMemtable, Memtable, ScanIterator, MAX_MEMTABLE_SIZE};
 
 // Re-export state types
 pub use state::{CompactionGuard, FreezeGuard, LsmState};

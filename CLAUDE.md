@@ -105,7 +105,8 @@ AshDB is an SQLite-inspired embedded database for time-series data, built in Rus
 
 - **Big-endian encoding**: Used throughout for cross-platform compatibility (manifest, WAL)
 - **Checksums**: CRC64 checksums on WAL entries and manifest records using `crc64fast`
-- **Merge iteration**: `MergeIterator` uses a binary heap to merge sorted iterators, deduplicating keys (newer values win)
+- **Merge iteration**: `LSMScanIterator` uses a binary heap to merge sorted iterators, deduplicating keys (newer values win)
+- **Lazy evaludation**: All iterators are lazily evaluated reducing space(memory) amplification especially on read heavy workloads.
 - **Lock-free reads**: Memtable uses `crossbeam-skiplist` for concurrent reads
 - **Atomic freezing**: Memtable freeze operation is atomic via `AtomicBool`
 
