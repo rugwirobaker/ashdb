@@ -6,8 +6,8 @@ use std::{
     },
 };
 
+use super::manifest::{Level, Manifest};
 use super::memtable::{ActiveMemtable, FrozenMemtable};
-use super::{manifest::Manifest, Level};
 use crate::error::Result;
 
 /// All mutable state for the LSM store with fine-grained locking

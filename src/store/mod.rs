@@ -63,7 +63,7 @@
 //!     assert_eq!(value, Some(b"bob".to_vec()));
 //!
 //!     // Range scan (leverages lexicographical ordering)
-//!     let results: Result<Vec<_>> = store.scan(b"user:1"..=b"user:2").collect();
+//!     let results: Result<Vec<_>> = store.scan(b"user:1".to_vec()..=b"user:2".to_vec()).collect();
 //!     let pairs = results?;
 //!     assert_eq!(pairs.len(), 2);
 //!

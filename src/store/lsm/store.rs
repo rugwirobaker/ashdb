@@ -9,7 +9,7 @@ use std::{fs, ops::RangeBounds, sync::Arc};
 const LOCK_FILE: &str = "ashdb.lock";
 
 /// LSM Store with interior mutability
-pub struct LsmStore {
+pub struct LsmTree {
     // Immutable configuration (public for background tasks)
     pub(super) config: LsmConfig,
     lock: Option<FileLock>,
@@ -18,7 +18,7 @@ pub struct LsmStore {
     pub(super) state: Arc<LsmState>,
 }
 
-impl LsmStore {
+impl LsmTree {
     /// Open store with default configuration
     pub fn open(dir: &str) -> Result<Self> {
         let config = LsmConfig::new(dir);
@@ -48,7 +48,7 @@ impl LsmStore {
     }
 }
 
-impl Drop for LsmStore {
+impl Drop for LsmTree {
     fn drop(&mut self) {
         // Release file lock
         if let Some(lock) = self.lock.take() {
@@ -57,7 +57,7 @@ impl Drop for LsmStore {
     }
 }
 
-impl Store for LsmStore {
+impl Store for LsmTree {
     type ScanIterator<'a> = LSMScanIterator<'a>;
 
     fn set(&self, key: &[u8], value: Vec<u8>) -> Result<()> {
@@ -168,7 +168,7 @@ impl Store for LsmStore {
     }
 }
 
-impl LsmStore {
+impl LsmTree {
     /// Freeze active memtable (atomic operation)
     pub fn freeze_active_memtable(&self) -> Result<()> {
         // Try to acquire freeze lock
@@ -290,13 +290,13 @@ mod tests {
     };
 
     // Helper function to create a test store with custom config
-    fn create_test_store_with_config(temp_dir: &TempDir, config: CompactionConfig) -> LsmStore {
+    fn create_test_store_with_config(temp_dir: &TempDir, config: CompactionConfig) -> LsmTree {
         let lsm_config = LsmConfig::new(temp_dir.path()).compaction(config);
-        LsmStore::open_with_config(lsm_config).expect("Failed to create store")
+        LsmTree::open_with_config(lsm_config).expect("Failed to create store")
     }
 
     // Helper function to create a test store with default aggressive compaction settings
-    fn create_test_store(temp_dir: &TempDir) -> LsmStore {
+    fn create_test_store(temp_dir: &TempDir) -> LsmTree {
         let compaction_config = CompactionConfig::default()
             .level0_compaction_threshold(2) // Lower threshold for easier testing
             .size_ratio_threshold(2) // Lower ratio for easier testing
@@ -308,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn test_store_implementation() -> Result<()> {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let store = LsmStore::open(temp_dir.path().to_str().unwrap())?;
+        let store = LsmTree::open(temp_dir.path().to_str().unwrap())?;
 
         // Test basic set/get operations
         store.set(b"key1", b"value1".to_vec())?;
@@ -403,10 +403,10 @@ mod tests {
         let store_path = temp_dir.path().to_str().unwrap();
 
         // First instance should acquire lock successfully
-        let store1 = LsmStore::open(store_path)?;
+        let store1 = LsmTree::open(store_path)?;
 
         // Second instance should fail to acquire lock
-        let result = LsmStore::open(store_path);
+        let result = LsmTree::open(store_path);
         assert!(
             result.is_err(),
             "Second instance should fail to open the same directory"
@@ -431,7 +431,7 @@ mod tests {
         drop(store1); // Release the lock
 
         // After first instance is dropped, second should be able to open
-        let store2 = LsmStore::open(store_path)?;
+        let store2 = LsmTree::open(store_path)?;
 
         // Verify data from first instance is recovered
         let value = store2.get(b"test_key")?;
@@ -447,13 +447,13 @@ mod tests {
 
         // Create and immediately close empty store
         {
-            let _store = LsmStore::open(store_path)?;
+            let _store = LsmTree::open(store_path)?;
             // Store is empty, just close it
         }
 
         // Reopen and verify it's still empty but functional
         {
-            let store = LsmStore::open(store_path)?;
+            let store = LsmTree::open(store_path)?;
 
             // Should be empty
             let scan_results: Result<Vec<_>> = store.scan(..).collect();

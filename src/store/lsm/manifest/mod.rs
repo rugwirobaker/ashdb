@@ -57,6 +57,7 @@
 
 pub mod edit;
 pub mod header;
+pub mod level;
 pub mod meta;
 
 use crate::error::Result;
@@ -253,6 +254,7 @@ impl Manifest {
     }
 }
 
+pub use level::{Level, SSTable};
 use meta::LevelMeta;
 
 #[derive(Debug, Clone)]
