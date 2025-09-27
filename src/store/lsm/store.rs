@@ -3,9 +3,8 @@ use super::{
     compaction, flush,
     iterator::{MergeIterator, OwningMemtableIter},
     memtable::ActiveMemtable,
-    metrics, recovery, wal_cleanup, LsmState,
+    recovery, LsmState,
 };
-
 use crate::{config::LsmConfig, error::Result, flock::FileLock};
 
 use std::{fs, ops::RangeBounds, sync::Arc};
@@ -33,6 +32,10 @@ impl LsmStore {
     pub fn open_with_config(config: LsmConfig) -> Result<Self> {
         fs::create_dir_all(&config.dir)?;
 
+        // Create subdirectories for organized storage
+        fs::create_dir_all(config.dir.join("sst"))?;
+        fs::create_dir_all(config.dir.join("wal"))?;
+
         // Acquire file lock
         let lock = FileLock::lock(config.dir.join(LOCK_FILE))?;
 
@@ -56,10 +59,7 @@ impl LsmStore {
         };
 
         // Create new active memtable
-        let new_wal_id = self.state.next_wal_id();
-        let wal_dir = self.config.dir.join("wal");
-        fs::create_dir_all(&wal_dir)?;
-        let wal_path = wal_dir.join(format!("{}.wal", new_wal_id));
+        let (new_wal_id, wal_path) = self.next_wal_path();
         let new_active = Arc::new(ActiveMemtable::new(wal_path.to_str().unwrap(), new_wal_id)?);
 
         // Atomic swap
@@ -87,27 +87,18 @@ impl LsmStore {
 
     /// Manually flush oldest frozen memtable to SSTable (for testing)
     pub async fn flush_memtable(&self) -> Result<bool> {
-        flush::flush_memtable(&self.state, &self.config).await
-    }
-
-    /// Get list of deletable WAL file IDs from manifest
-    pub fn deletable_wals(&self) -> Result<Vec<u64>> {
-        wal_cleanup::deletable_wals(&self.state)
-    }
-
-    /// Clean up WAL files that are no longer needed
-    pub async fn cleanup_wals(&self) -> Result<()> {
-        wal_cleanup::cleanup_wals(&self.state, &self.config).await
+        flush::flush_memtable(self).await
     }
 
     /// Perform tiered compaction if needed
     pub async fn compact(&self) -> Result<()> {
-        compaction::compact(&self.state, &self.config).await
-    }
+        // Check if it's safe to perform compaction
+        if !self.state.is_operation_safe() {
+            tracing::info!("Skipping compaction - other operations in progress");
+            return Ok(());
+        }
 
-    /// Collect and log metrics
-    pub fn collect_metrics(&self) -> Result<()> {
-        metrics::collect_metrics(&self.state)
+        compaction::compact(self).await
     }
 
     /// Check if flush is needed
@@ -116,28 +107,123 @@ impl LsmStore {
     }
 
     /// Try to mark flush as pending (returns true if successfully marked)
-    pub fn try_mark_flush_pending(&self) -> bool {
+    pub(super) fn try_mark_flush_pending(&self) -> bool {
         self.state.try_mark_flush_pending()
     }
 
     /// Mark flush as completed
-    pub fn mark_flush_completed(&self) {
+    pub(super) fn mark_flush_completed(&self) {
         self.state.mark_flush_completed()
     }
 
-    /// Get flush interval from config
-    pub fn flush_interval(&self) -> std::time::Duration {
-        self.config.flush_interval
+    /// Generate next WAL ID and construct its path
+    pub(super) fn next_wal_path(&self) -> (u64, std::path::PathBuf) {
+        let wal_id = self.state.next_wal_id();
+        let path = self
+            .config
+            .dir
+            .join("wal")
+            .join(format!("{:08}.wal", wal_id));
+        (wal_id, path)
     }
 
-    /// Get compaction interval from config
-    pub fn compaction_interval(&self) -> std::time::Duration {
-        self.config.compaction_interval
+    /// Generate next SSTable ID and construct its path
+    pub(super) fn next_sstable_path(&self) -> (u64, std::path::PathBuf) {
+        let table_id = self.state.next_sstable_id();
+        let path = self
+            .config
+            .dir
+            .join("sst")
+            .join(format!("{:08}.sst", table_id));
+        (table_id, path)
     }
 
-    /// Get WAL cleanup interval from config
-    pub fn wal_cleanup_interval(&self) -> std::time::Duration {
-        self.config.wal_cleanup_interval
+    /// Construct path for existing WAL by ID
+    pub(super) fn wal_path(&self, wal_id: u64) -> std::path::PathBuf {
+        self.config
+            .dir
+            .join("wal")
+            .join(format!("{:08}.wal", wal_id))
+    }
+
+    /// Construct path for existing SSTable by ID
+    pub(super) fn sstable_path(&self, table_id: u64) -> std::path::PathBuf {
+        self.config
+            .dir
+            .join("sst")
+            .join(format!("{:08}.sst", table_id))
+    }
+
+    /// Get current health metrics for monitoring and debugging
+    pub fn get_health_metrics(&self) -> super::state::StateMetrics {
+        self.state.get_state_metrics()
+    }
+
+    /// Comprehensive validation for debug builds and testing
+    #[cfg(debug_assertions)]
+    pub fn validate_comprehensive(&self) -> Result<()> {
+        tracing::debug!("Starting comprehensive validation");
+
+        // Basic consistency validation
+        self.state.validate_consistency()?;
+
+        // SSTable ID uniqueness validation
+        self.state.validate_sstable_id_uniqueness()?;
+
+        // Level key ordering validation
+        self.state.validate_level_key_ordering()?;
+
+        tracing::debug!("Comprehensive validation passed");
+        Ok(())
+    }
+
+    /// Run periodic health check with validation
+    pub fn health_check(&self) -> Result<super::state::StateMetrics> {
+        let metrics = self.get_health_metrics();
+
+        // Log health metrics
+        tracing::info!(
+            "LSM Health Check - levels: {}, tables: {}, active_size: {}, frozen: {}, operations: compaction={}, freeze={}, flush={}",
+            metrics.level_count,
+            metrics.total_sstable_count,
+            metrics.active_memtable_size,
+            metrics.frozen_memtable_count,
+            metrics.compaction_running,
+            metrics.freeze_in_progress,
+            metrics.flush_pending
+        );
+
+        // Warn about potential issues
+        if metrics.compaction_running > 2 {
+            tracing::warn!(
+                "Multiple compactions running: {}",
+                metrics.compaction_running
+            );
+        }
+
+        if metrics.frozen_memtable_count > 10 {
+            tracing::warn!(
+                "High number of frozen memtables: {}",
+                metrics.frozen_memtable_count
+            );
+        }
+
+        // Basic consistency check in production
+        if let Err(e) = self.state.validate_consistency() {
+            tracing::error!("Health check detected inconsistency: {:?}", e);
+            return Err(e);
+        }
+
+        // Comprehensive validation in debug builds
+        #[cfg(debug_assertions)]
+        {
+            if let Err(e) = self.validate_comprehensive() {
+                tracing::error!("Comprehensive health check failed: {:?}", e);
+                return Err(e);
+            }
+        }
+
+        Ok(metrics)
     }
 }
 
@@ -251,7 +337,7 @@ impl Store for LsmStore {
         MergeIterator::new(iterators)
     }
 
-    fn flush(&self) -> Result<()> {
+    fn sync(&self) -> Result<()> {
         let active = self.state.active_memtable.read().unwrap();
         active.sync()
     }
@@ -428,11 +514,10 @@ mod tests {
                 store.set(key.as_bytes(), value.as_bytes().to_vec())?;
             }
 
-            // Force flush
-            store.state.try_mark_flush_pending();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            while store.state.needs_flush() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            // Force flush using public API
+            store.freeze_active_memtable()?;
+            while store.flush_memtable().await? {
+                // Keep flushing until no more frozen memtables
             }
         }
 
@@ -517,11 +602,10 @@ mod tests {
             let value = format!("value_{}", i);
             store.set(key.as_bytes(), value.as_bytes().to_vec())?;
 
-            // Force flush to create individual tables
-            store.state.try_mark_flush_pending();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            while store.state.needs_flush() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            // Force flush to create individual tables using public API
+            store.freeze_active_memtable()?;
+            while store.flush_memtable().await? {
+                // Keep flushing until no more frozen memtables
             }
         }
 
@@ -549,11 +633,10 @@ mod tests {
         // Add minimal data (below compaction thresholds)
         store.set(b"key1", b"value1".to_vec())?;
 
-        // Force flush but don't exceed L0 threshold
-        store.state.try_mark_flush_pending();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        while store.state.needs_flush() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        // Force flush but don't exceed L0 threshold using public API
+        store.freeze_active_memtable()?;
+        while store.flush_memtable().await? {
+            // Keep flushing until no more frozen memtables
         }
 
         // Record initial state
@@ -698,11 +781,10 @@ mod tests {
                 store.set(key.as_bytes(), value.as_bytes().to_vec())?;
             }
 
-            // Force flush
-            store.state.try_mark_flush_pending();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            while store.state.needs_flush() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            // Force flush using public API
+            store.freeze_active_memtable()?;
+            while store.flush_memtable().await? {
+                // Keep flushing until no more frozen memtables
             }
         }
 
@@ -824,91 +906,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wal_cleanup_no_deletable() -> Result<()> {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let store = create_test_store(&temp_dir);
-
-        // With a fresh store, there should be no deletable WALs
-        let _deletable = store.deletable_wals()?;
-        // Should return a valid list (no assertion needed, if it fails it will panic)
-
-        // Cleanup should be a no-op
-        store.cleanup_wals().await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_wal_cleanup_after_flush() -> Result<()> {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let store = create_test_store(&temp_dir);
 
-        // Add data and flush to create a scenario where WALs might be deletable
+        // Add data and flush to test WAL cleanup integration
         for i in 0..10 {
             let key = format!("key_{:03}", i);
             let value = format!("value_{}", i);
             store.set(key.as_bytes(), value.as_bytes().to_vec())?;
         }
 
-        // Freeze and flush
+        // Freeze and flush (WAL cleanup is now integrated into flush)
         store.freeze_active_memtable()?;
         let flushed = store.flush_memtable().await?;
         assert!(flushed, "Should have flushed a memtable");
 
-        // Try cleanup - should handle gracefully even if no WALs are deletable yet
-        store.cleanup_wals().await?;
-
-        // Verify data is still accessible
+        // Verify data is still accessible after flush (with integrated WAL cleanup)
         for i in 0..10 {
             let key = format!("key_{:03}", i);
             let value = store.get(key.as_bytes())?;
             assert!(
                 value.is_some(),
-                "Key {} should be accessible after cleanup",
+                "Key {} should be accessible after flush with cleanup",
                 key
             );
         }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_wal_cleanup_missing_file() -> Result<()> {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let store = create_test_store(&temp_dir);
-
-        // Add some data
-        for i in 0..5 {
-            let key = format!("key_{:03}", i);
-            let value = format!("value_{}", i);
-            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
-        }
-
-        // Create WAL directory structure
-        let wal_dir = temp_dir.path().join("wal");
-        std::fs::create_dir_all(&wal_dir)?;
-
-        // Create a fake WAL file that we can test deletion with
-        let test_wal_path = wal_dir.join("999.wal");
-        std::fs::write(&test_wal_path, b"test")?;
-
-        // Delete the file to simulate missing file scenario
-        std::fs::remove_file(&test_wal_path)?;
-
-        // Cleanup should handle missing files gracefully (tested indirectly through no panic)
-        store.cleanup_wals().await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_deletable_wals_method() -> Result<()> {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let store = create_test_store(&temp_dir);
-
-        // The deletable_wals method should work without error
-        let _deletable = store.deletable_wals()?;
-        // For a fresh store, this should return a valid list (no assertion needed, if it fails it will panic)
 
         Ok(())
     }
@@ -918,7 +941,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let store = create_test_store(&temp_dir);
 
-        // Create data that will result in multiple memtables and potential WAL cleanup
+        // Create data that will result in multiple memtables with integrated WAL cleanup
         for batch in 0..2 {
             for i in 0..20 {
                 let key = format!("integration_{}_{:03}", batch, i);
@@ -926,24 +949,21 @@ mod tests {
                 store.set(key.as_bytes(), value.as_bytes().to_vec())?;
             }
 
-            // Freeze and flush each batch
+            // Freeze and flush each batch (WAL cleanup integrated into flush)
             store.freeze_active_memtable()?;
             while store.flush_memtable().await? {
                 // Keep flushing until no more frozen memtables
             }
         }
 
-        // Run cleanup
-        store.cleanup_wals().await?;
-
-        // Verify all data is still accessible
+        // Verify all data is still accessible after flush with integrated cleanup
         for batch in 0..2 {
             for i in 0..20 {
                 let key = format!("integration_{}_{:03}", batch, i);
                 let value = store.get(key.as_bytes())?;
                 assert!(
                     value.is_some(),
-                    "Key {} should be accessible after flush and cleanup",
+                    "Key {} should be accessible after flush with cleanup",
                     key
                 );
             }
@@ -962,9 +982,1016 @@ mod tests {
         for i in 1..results.len() {
             assert!(
                 results[i - 1].0 < results[i].0,
-                "Keys should be in order after flush and cleanup"
+                "Keys should be in order after flush with cleanup"
             );
         }
+
+        Ok(())
+    }
+
+    // ===== PUBLIC API TESTS =====
+    // Tests that exercise the 4 core public API methods in realistic patterns
+
+    #[tokio::test]
+    async fn test_manual_flush_cycle() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Initially should not need flush
+        assert!(!store.needs_flush(), "Fresh store should not need flush");
+
+        // Write data until we have a frozen memtable
+        for i in 0..10 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        // Manually freeze to create a frozen memtable
+        store.freeze_active_memtable()?;
+
+        // Now should need flush
+        assert!(
+            store.needs_flush(),
+            "Should need flush after freezing memtable"
+        );
+
+        // Manual flush using public API
+        let flushed = store.flush_memtable().await?;
+        assert!(flushed, "Should have flushed a memtable");
+
+        // Should no longer need flush
+        assert!(!store.needs_flush(), "Should not need flush after flushing");
+
+        // Verify data is still accessible
+        for i in 0..10 {
+            let key = format!("key_{:03}", i);
+            let value = store.get(key.as_bytes())?;
+            assert!(
+                value.is_some(),
+                "Key {} should be accessible after flush",
+                key
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_manual_compaction_cycle() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Initially should not need compaction
+        assert!(
+            !store.needs_compaction(),
+            "Fresh store should not need compaction"
+        );
+
+        // Create multiple SSTables to trigger compaction need
+        for table_idx in 0..4 {
+            // Exceed our threshold of 2
+            for i in 0..20 {
+                let key = format!("table_{}_key_{:03}", table_idx, i);
+                let value = format!("value_{}", i);
+                store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+            }
+
+            // Create SSTable using public API
+            store.freeze_active_memtable()?;
+            let flushed = store.flush_memtable().await?;
+            assert!(flushed, "Should have flushed memtable {}", table_idx);
+        }
+
+        // Now should need compaction
+        assert!(
+            store.needs_compaction(),
+            "Should need compaction after creating multiple SSTables"
+        );
+
+        // Manual compaction using public API
+        store.compact().await?;
+
+        // Should no longer need compaction (or need less)
+        // Note: might still need some compaction depending on the result
+        let compaction_reduced = !store.needs_compaction() || {
+            // If still needs compaction, verify structure improved
+            let levels = store.state.levels.read().unwrap();
+            levels.len() >= 2 && levels[1].table_count() > 0
+        };
+        assert!(
+            compaction_reduced,
+            "Compaction should reduce need or create multi-level structure"
+        );
+
+        // Verify all data is still accessible
+        for table_idx in 0..4 {
+            for i in 0..20 {
+                let key = format!("table_{}_key_{:03}", table_idx, i);
+                let value = store.get(key.as_bytes())?;
+                assert!(
+                    value.is_some(),
+                    "Key {} should be accessible after compaction",
+                    key
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_workflow() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        let mut total_entries = 0;
+
+        // Simulate realistic maintenance workflow
+        for batch in 0..6 {
+            // Write a batch of data
+            for i in 0..30 {
+                let key = format!("batch_{}_key_{:03}", batch, i);
+                let value = format!("value_{}", i);
+                store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+                total_entries += 1;
+            }
+
+            // Periodic flush check using public API
+            if store.needs_flush() {
+                while store.flush_memtable().await? {
+                    // Keep flushing until no more frozen memtables
+                }
+            }
+
+            // Periodic compaction check using public API
+            if store.needs_compaction() {
+                store.compact().await?;
+            }
+
+            // Every few batches, force a freeze to create more SSTables
+            if batch % 2 == 0 {
+                store.freeze_active_memtable()?;
+            }
+        }
+
+        // Final maintenance cycle
+        while store.flush_memtable().await? {
+            // Flush any remaining frozen memtables
+        }
+
+        if store.needs_compaction() {
+            store.compact().await?;
+        }
+
+        // Verify all data is accessible
+        let mut found_entries = 0;
+        for batch in 0..6 {
+            for i in 0..30 {
+                let key = format!("batch_{}_key_{:03}", batch, i);
+                if store.get(key.as_bytes())?.is_some() {
+                    found_entries += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            found_entries, total_entries,
+            "All entries should be accessible after maintenance"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_api_contracts() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Test initial state
+        assert!(!store.needs_flush(), "Fresh store should not need flush");
+        assert!(
+            !store.needs_compaction(),
+            "Fresh store should not need compaction"
+        );
+
+        // Test flush when nothing to flush
+        let flushed = store.flush_memtable().await?;
+        assert!(!flushed, "Should return false when nothing to flush");
+
+        // Test compaction when not needed (should succeed gracefully)
+        store.compact().await?; // Should not error
+
+        // Test after adding minimal data
+        store.set(b"test_key", b"test_value".to_vec())?;
+
+        // Should still not need flush (not frozen yet)
+        assert!(
+            !store.needs_flush(),
+            "Should not need flush with just active memtable"
+        );
+
+        // Freeze to create need for flush
+        store.freeze_active_memtable()?;
+        assert!(store.needs_flush(), "Should need flush after freezing");
+
+        // Test multiple flush calls
+        let first_flush = store.flush_memtable().await?;
+        assert!(first_flush, "First flush should succeed");
+
+        let second_flush = store.flush_memtable().await?;
+        assert!(
+            !second_flush,
+            "Second flush should return false (nothing to flush)"
+        );
+
+        // Verify data integrity maintained
+        let value = store.get(b"test_key")?;
+        assert_eq!(
+            value,
+            Some(b"test_value".to_vec()),
+            "Data should be preserved through API operations"
+        );
+
+        Ok(())
+    }
+
+    // ===== STATE CONSISTENCY TESTS =====
+    // Tests that ensure state is properly maintained across restarts and operations
+
+    #[tokio::test]
+    async fn test_state_recovery_after_restart() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store_path = temp_dir.path();
+
+        // Initial data to persist
+        let test_data = vec![("key1", "value1"), ("key2", "value2"), ("key3", "value3")];
+
+        // First session: write data and flush
+        {
+            let store = LsmStore::open(store_path.to_str().unwrap())?;
+
+            for (key, value) in &test_data {
+                store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+            }
+
+            // Force flush to ensure data is persisted
+            store.freeze_active_memtable()?;
+            while store.flush_memtable().await? {
+                // Keep flushing until no more frozen memtables
+            }
+
+            // Verify data is accessible before restart
+            for (key, expected_value) in &test_data {
+                let value = store.get(key.as_bytes())?;
+                assert_eq!(value, Some(expected_value.as_bytes().to_vec()));
+            }
+        } // Store is dropped here, triggering manifest sync
+
+        // Second session: reopen and verify data is recovered
+        {
+            let store = LsmStore::open(store_path.to_str().unwrap())?;
+
+            // Verify all data is still accessible after restart
+            for (key, expected_value) in &test_data {
+                let value = store.get(key.as_bytes())?;
+                assert_eq!(
+                    value,
+                    Some(expected_value.as_bytes().to_vec()),
+                    "Key {} should be recovered after restart",
+                    key
+                );
+            }
+
+            // Verify scan still works correctly
+            let scan_results: Result<Vec<_>> = store.scan(..).collect();
+            let results = scan_results?;
+            assert_eq!(results.len(), test_data.len());
+
+            // Verify keys are in correct order
+            for i in 1..results.len() {
+                assert!(
+                    results[i - 1].0 < results[i].0,
+                    "Keys should be in order after recovery"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_state_consistency_after_compaction_and_restart() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store_path = temp_dir.path();
+
+        // Create multiple SSTables, then compact, then restart
+        {
+            let store = create_test_store(&temp_dir);
+
+            // Create data that will result in multiple L0 tables
+            populate_multiple_tables(&store, 4).await?;
+
+            // Verify compaction is needed
+            assert!(
+                store.needs_compaction(),
+                "Should need compaction after populating tables"
+            );
+
+            // Perform compaction
+            store.compact().await?;
+
+            // Verify some data after compaction
+            let value = store.get(b"key_000_000")?;
+            assert!(
+                value.is_some(),
+                "Data should be accessible after compaction"
+            );
+        }
+
+        // Restart and verify compacted state is recovered
+        {
+            let store = LsmStore::open(store_path.to_str().unwrap())?;
+
+            // Verify the compacted structure was recovered
+            {
+                let levels = store.state.levels.read().unwrap();
+                assert!(
+                    levels.len() >= 2,
+                    "Should have recovered multi-level structure after compaction"
+                );
+            }
+
+            // Verify all data is still accessible
+            for table_idx in 0..4 {
+                for i in 0..100 {
+                    let key = format!("key_{:03}_{:03}", table_idx, i);
+                    let value = store.get(key.as_bytes())?;
+                    assert!(
+                        value.is_some(),
+                        "Key {} should be accessible after compaction recovery",
+                        key
+                    );
+                }
+            }
+
+            // Verify scan integrity
+            let scan_results: Result<Vec<_>> = store.scan(..).collect();
+            let results = scan_results?;
+            assert_eq!(
+                results.len(),
+                400,
+                "Should have all 400 entries after recovery"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_manifest_state_consistency() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Perform several operations that modify state
+        populate_multiple_tables(&store, 3).await?;
+        store.compact().await?;
+
+        // Compare manifest state with in-memory state
+        let manifest_state = {
+            let manifest = store.state.manifest.read().unwrap();
+            manifest.replay()?
+        };
+
+        let in_memory_levels = store.state.levels.read().unwrap();
+
+        // Verify level count consistency
+        assert_eq!(
+            manifest_state.levels.len(),
+            in_memory_levels.len(),
+            "Manifest and in-memory level count should match"
+        );
+
+        // Verify table count consistency per level
+        for (level_idx, level_meta) in manifest_state.levels.iter().enumerate() {
+            if level_idx < in_memory_levels.len() {
+                assert_eq!(
+                    level_meta.tables.len(),
+                    in_memory_levels[level_idx].table_count(),
+                    "Table count should match between manifest and memory for level {}",
+                    level_idx
+                );
+            }
+        }
+
+        // Verify next table ID consistency
+        let current_max_id = in_memory_levels
+            .iter()
+            .flat_map(|level| &level.sstables)
+            .map(|table| table.id)
+            .max()
+            .unwrap_or(0);
+
+        assert!(
+            manifest_state.next_table_id > current_max_id,
+            "Next table ID should be greater than current max table ID"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_state_recovery_with_mixed_operations() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store_path = temp_dir.path();
+
+        // Test basic write, flush, compaction cycle
+        {
+            let store = LsmStore::open(store_path.to_str().unwrap())?;
+
+            // Write data across multiple sessions that will create multiple SSTables
+            for batch in 0..3 {
+                for i in 0..30 {
+                    let key = format!("batch_{}_key_{:03}", batch, i);
+                    let value = format!("value_{}", i);
+                    store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+                }
+                store.freeze_active_memtable()?;
+                while store.flush_memtable().await? {}
+            }
+
+            if store.needs_compaction() {
+                store.compact().await?;
+            }
+
+            // Verify some data exists
+            let value = store.get(b"batch_0_key_000")?;
+            assert!(value.is_some(), "Data should exist after operations");
+        }
+
+        // Recovery verification after restart
+        {
+            let store = LsmStore::open(store_path.to_str().unwrap())?;
+
+            // Verify data exists after recovery
+            let value = store.get(b"batch_0_key_000")?;
+            assert!(value.is_some(), "Data should exist after recovery");
+
+            // Verify scan works
+            let scan_results: Result<Vec<_>> = store.scan(..).collect();
+            let results = scan_results?;
+            assert!(!results.is_empty(), "Should have data after recovery");
+
+            // Verify state validation passes
+            assert!(
+                store.state.validate_consistency().is_ok(),
+                "State should be consistent after recovery"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_empty_store_recovery() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store_path = temp_dir.path();
+
+        // Create and immediately close empty store
+        {
+            let _store = LsmStore::open(store_path.to_str().unwrap())?;
+            // Store is empty, just close it
+        }
+
+        // Reopen and verify it's still empty but functional
+        {
+            let store = LsmStore::open(store_path.to_str().unwrap())?;
+
+            // Should be empty
+            let scan_results: Result<Vec<_>> = store.scan(..).collect();
+            let results = scan_results?;
+            assert!(results.is_empty(), "Recovered empty store should be empty");
+
+            // Should still be functional
+            store.set(b"test_key", b"test_value".to_vec())?;
+            let value = store.get(b"test_key")?;
+            assert_eq!(value, Some(b"test_value".to_vec()));
+        }
+
+        Ok(())
+    }
+
+    // ===== CONCURRENT OPERATION TESTS =====
+    // Tests that ensure state consistency during concurrent operations
+
+    #[tokio::test]
+    async fn test_concurrent_flush_operations() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = Arc::new(create_test_store(&temp_dir));
+
+        // Create some frozen memtables
+        for batch in 0..3 {
+            for i in 0..50 {
+                let key = format!("batch_{}_key_{:03}", batch, i);
+                let value = format!("value_{}", i);
+                store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+            }
+            store.freeze_active_memtable()?;
+        }
+
+        // Launch multiple concurrent flush operations
+        let mut handles = Vec::new();
+        for task_id in 0..3 {
+            let store_clone = Arc::clone(&store);
+            let handle = tokio::spawn(async move {
+                let mut flush_count = 0;
+                while store_clone.flush_memtable().await.unwrap_or(false) {
+                    flush_count += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                (task_id, flush_count)
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all flush operations to complete
+        let mut total_flushes = 0;
+        for handle in handles {
+            let (_, flush_count) = handle.await.unwrap();
+            total_flushes += flush_count;
+        }
+
+        // Should have flushed exactly 3 memtables total (no double-flushing)
+        assert_eq!(
+            total_flushes, 3,
+            "Should have flushed exactly 3 memtables total"
+        );
+
+        // Verify no frozen memtables remain
+        assert!(
+            !store.needs_flush(),
+            "Should not need flush after concurrent operations"
+        );
+
+        // Verify data integrity
+        for batch in 0..3 {
+            for i in 0..50 {
+                let key = format!("batch_{}_key_{:03}", batch, i);
+                let value = store.get(key.as_bytes())?;
+                assert!(
+                    value.is_some(),
+                    "Data should be preserved during concurrent flush"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_freeze_operations() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = Arc::new(create_test_store(&temp_dir));
+
+        // Fill active memtable close to capacity
+        for i in 0..1000 {
+            let key = format!("key_{:06}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        // Launch multiple concurrent freeze operations
+        let mut handles = Vec::new();
+        for task_id in 0..5 {
+            let store_clone = Arc::clone(&store);
+            let handle = tokio::spawn(async move {
+                let result = store_clone.freeze_active_memtable();
+                (task_id, result.is_ok())
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all freeze attempts
+        let mut successful_freezes = 0;
+        for handle in handles {
+            let (_, success) = handle.await.unwrap();
+            if success {
+                successful_freezes += 1;
+            }
+        }
+
+        // All should succeed (the guard mechanism ensures atomicity)
+        assert_eq!(
+            successful_freezes, 5,
+            "All freeze operations should succeed"
+        );
+
+        // Verify we have multiple frozen memtables now
+        let frozen_count = {
+            let frozen = store.state.frozen_memtables.read().unwrap();
+            frozen.len()
+        };
+        assert!(
+            frozen_count >= 1,
+            "Should have at least one frozen memtable"
+        );
+
+        // Verify data integrity
+        for i in 0..1000 {
+            let key = format!("key_{:06}", i);
+            let value = store.get(key.as_bytes())?;
+            assert!(
+                value.is_some(),
+                "Data should be preserved during concurrent freeze operations"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mixed_concurrent_operations() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = Arc::new(create_test_store(&temp_dir));
+
+        // Set up initial state with some data
+        for i in 0..100 {
+            let key = format!("initial_key_{:03}", i);
+            let value = format!("initial_value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+        store.freeze_active_memtable()?;
+
+        // Create more data to trigger various operations
+        populate_multiple_tables(&store, 2).await?;
+
+        // Launch mixed concurrent operations
+        let mut handles = Vec::new();
+
+        // Flush operations
+        for task_id in 0..2 {
+            let store_clone = Arc::clone(&store);
+            let handle = tokio::spawn(async move {
+                let mut ops = 0;
+                while store_clone.flush_memtable().await.unwrap_or(false) {
+                    ops += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                format!("flush_{}: {} ops", task_id, ops)
+            });
+            handles.push(handle);
+        }
+
+        // Compaction operations
+        for task_id in 0..2 {
+            let store_clone = Arc::clone(&store);
+            let handle = tokio::spawn(async move {
+                if store_clone.needs_compaction() {
+                    let result = store_clone.compact().await;
+                    format!("compact_{}: {}", task_id, result.is_ok())
+                } else {
+                    format!("compact_{}: not_needed", task_id)
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Write operations (to test coordination with background operations)
+        for task_id in 0..2 {
+            let store_clone = Arc::clone(&store);
+            let handle = tokio::spawn(async move {
+                let mut writes = 0;
+                for i in 0..50 {
+                    let key = format!("concurrent_{}_{:03}", task_id, i);
+                    let value = format!("value_{}", i);
+                    if store_clone
+                        .set(key.as_bytes(), value.as_bytes().to_vec())
+                        .is_ok()
+                    {
+                        writes += 1;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                format!("write_{}: {} writes", task_id, writes)
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all operations to complete
+        for handle in handles {
+            let op_result = handle.await.unwrap();
+            println!("Operation result: {}", op_result);
+        }
+
+        // Verify final state consistency
+        // All initial data should still be accessible
+        for i in 0..100 {
+            let key = format!("initial_key_{:03}", i);
+            let value = store.get(key.as_bytes())?;
+            assert!(
+                value.is_some(),
+                "Initial data should survive concurrent operations"
+            );
+        }
+
+        // All concurrent writes should be accessible
+        for task_id in 0..2 {
+            for i in 0..50 {
+                let key = format!("concurrent_{}_{:03}", task_id, i);
+                let value = store.get(key.as_bytes())?;
+                assert!(
+                    value.is_some(),
+                    "Concurrent write data should be accessible"
+                );
+            }
+        }
+
+        // Verify scan integrity (all data in order)
+        let scan_results: Result<Vec<_>> = store.scan(..).collect();
+        let results = scan_results?;
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].0 < results[i].0,
+                "All data should be in correct order after mixed operations"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_directory_access() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store_path = temp_dir.path().to_str().unwrap();
+
+        // First instance should acquire lock successfully
+        let store1 = LsmStore::open(store_path)?;
+
+        // Second instance should fail to acquire lock
+        let result = LsmStore::open(store_path);
+        assert!(
+            result.is_err(),
+            "Second instance should fail to open the same directory"
+        );
+
+        // Add some data to first instance
+        store1.set(b"test_key", b"test_value".to_vec())?;
+
+        // Verify the lock error is what we expect
+        match result {
+            Err(crate::Error::LockError(_)) | Err(crate::Error::IoError(_)) => {
+                // Expected - file lock should cause a lock or IO error
+            }
+            Err(other) => {
+                panic!("Expected lock/IO error for file lock, got: {:?}", other);
+            }
+            Ok(_) => {
+                panic!("Should not be able to open same directory twice");
+            }
+        }
+
+        drop(store1); // Release the lock
+
+        // After first instance is dropped, second should be able to open
+        let store2 = LsmStore::open(store_path)?;
+
+        // Verify data from first instance is recovered
+        let value = store2.get(b"test_key")?;
+        assert_eq!(value, Some(b"test_value".to_vec()));
+
+        Ok(())
+    }
+
+    // ===== STATE VALIDATION TESTS =====
+    // Tests for the state validation methods
+
+    #[tokio::test]
+    async fn test_state_consistency_validation() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Initially state should be consistent
+        if let Err(e) = store.state.validate_consistency() {
+            panic!("Initial state validation failed: {:?}", e);
+        }
+
+        // Test with normal operations that properly record to manifest
+        for i in 0..50 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        // Force flush to ensure manifest is updated
+        store.freeze_active_memtable()?;
+        while store.flush_memtable().await? {}
+
+        // State should be consistent after proper flush
+        if let Err(e) = store.state.validate_consistency() {
+            panic!("State validation failed after flush: {:?}", e);
+        }
+
+        // Perform compaction if needed
+        if store.needs_compaction() {
+            store.compact().await?;
+
+            // State should remain consistent after compaction
+            if let Err(e) = store.state.validate_consistency() {
+                panic!("State validation failed after compaction: {:?}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sstable_id_uniqueness_validation() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Initially should be valid (no SSTables)
+        assert!(store.state.validate_sstable_id_uniqueness().is_ok());
+
+        // Add some tables
+        populate_multiple_tables(&store, 3).await?;
+
+        // Should still be valid (all IDs should be unique)
+        assert!(store.state.validate_sstable_id_uniqueness().is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_state_metrics() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Get initial metrics
+        let initial_metrics = store.state.get_state_metrics();
+        assert_eq!(initial_metrics.level_count, 0);
+        assert_eq!(initial_metrics.total_sstable_count, 0);
+        assert_eq!(initial_metrics.frozen_memtable_count, 0);
+
+        // Add some data
+        for i in 0..50 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        let after_writes = store.state.get_state_metrics();
+        assert!(after_writes.active_memtable_size > 0);
+
+        // Freeze memtable
+        store.freeze_active_memtable()?;
+
+        let after_freeze = store.state.get_state_metrics();
+        assert_eq!(after_freeze.frozen_memtable_count, 1);
+
+        // Flush memtable
+        while store.flush_memtable().await? {}
+
+        let after_flush = store.state.get_state_metrics();
+        assert_eq!(after_flush.frozen_memtable_count, 0);
+        assert!(after_flush.level_count >= 1);
+        assert!(after_flush.total_sstable_count >= 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_operation_safety_check() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Initially should be safe
+        assert!(store.state.is_operation_safe());
+
+        // Start a compaction guard
+        let _guard = store.state.start_compaction();
+        assert!(!store.state.is_operation_safe());
+
+        // Drop the guard
+        drop(_guard);
+        assert!(store.state.is_operation_safe());
+
+        // Test freeze guard
+        let _freeze_guard = store.state.try_start_freeze();
+        assert!(!store.state.is_operation_safe());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_level_key_ordering_validation() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Initially should be valid (no levels)
+        assert!(store.state.validate_level_key_ordering().is_ok());
+
+        // Add ordered data
+        for i in 0..100 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        store.freeze_active_memtable()?;
+        while store.flush_memtable().await? {}
+
+        // Should still be valid after flush (creates L0 tables which can overlap)
+        assert!(store.state.validate_level_key_ordering().is_ok());
+
+        // After compaction, higher levels should have non-overlapping tables
+        if store.needs_compaction() {
+            store.compact().await?;
+            assert!(store.state.validate_level_key_ordering().is_ok());
+        }
+
+        Ok(())
+    }
+
+    // ===== VALIDATION INTEGRATION TESTS =====
+    // Tests for the newly integrated validation functionality
+
+    #[tokio::test]
+    async fn test_health_check_api() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Test initial health check
+        let initial_metrics = store.health_check()?;
+        assert_eq!(initial_metrics.level_count, 0);
+        assert_eq!(initial_metrics.total_sstable_count, 0);
+        assert_eq!(initial_metrics.frozen_memtable_count, 0);
+
+        // Add some data and test health check again
+        for i in 0..50 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        let after_writes = store.health_check()?;
+        assert!(after_writes.active_memtable_size > 0);
+
+        // Test health check after operations
+        store.freeze_active_memtable()?;
+        let after_freeze = store.health_check()?;
+        assert_eq!(after_freeze.frozen_memtable_count, 1);
+
+        while store.flush_memtable().await? {}
+        let after_flush = store.health_check()?;
+        assert_eq!(after_flush.frozen_memtable_count, 0);
+        assert!(after_flush.level_count >= 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_validation_api_integration() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Test basic validation API
+        assert!(store.state.validate_consistency().is_ok());
+        assert!(store.state.is_operation_safe());
+
+        // Test validation with data
+        populate_multiple_tables(&store, 2).await?;
+
+        // Should still be valid after operations
+        assert!(store.state.validate_consistency().is_ok());
+
+        // Test comprehensive validation in debug mode
+        #[cfg(debug_assertions)]
+        {
+            assert!(store.validate_comprehensive().is_ok());
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_operation_safety_integration() -> Result<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let store = create_test_store(&temp_dir);
+
+        // Initially should be safe
+        assert!(store.state.is_operation_safe());
+
+        // Create conditions where compaction might be needed
+        populate_multiple_tables(&store, 3).await?;
+
+        // Test that compaction respects safety check
+        // (Note: the safety check in compact() will skip if unsafe,
+        // but won't fail the test as it returns Ok(()))
+        let result = store.compact().await;
+        assert!(result.is_ok());
+
+        // Verify state remains consistent
+        assert!(store.state.validate_consistency().is_ok());
 
         Ok(())
     }

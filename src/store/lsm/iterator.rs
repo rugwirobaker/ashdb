@@ -67,7 +67,7 @@ impl PartialOrd for HeapEntry<'_> {
 impl Ord for HeapEntry<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.key.cmp(&other.key) {
-            Ordering::Equal => other.source.cmp(&self.source),
+            Ordering::Equal => self.source.cmp(&other.source),
             other => other.reverse(),
         }
     }

@@ -1,8 +1,5 @@
 use super::{Level, LsmState, SSTable};
-use crate::{
-    config::{CompactionConfig, LsmConfig},
-    error::Result,
-};
+use crate::{config::CompactionConfig, error::Result};
 
 use super::iterator::{KvIterator, MergeIterator};
 
@@ -65,7 +62,9 @@ pub fn find_compaction_level(state: &LsmState, config: &CompactionConfig) -> Opt
 }
 
 /// Perform tiered compaction if needed
-pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
+pub async fn compact(store: &super::LsmStore) -> Result<()> {
+    let state = &store.state;
+    let config = &store.config;
     let _guard = state.start_compaction();
 
     // Find which level needs compaction
@@ -114,8 +113,7 @@ pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
     // 2. Create merge iterator and write to new SSTable
     let merge_iter = MergeIterator::new(iterators);
 
-    let table_id = state.next_sstable_id();
-    let table_path = config.dir.join(format!("{}.sst", table_id));
+    let (table_id, table_path) = store.next_sstable_path();
     let mut writable_table = super::sstable::table::Table::writable(table_path.to_str().unwrap())?;
 
     let mut builder = super::sstable::block::Builder::new();
@@ -221,7 +219,7 @@ pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
 
     // 6. Delete old SSTable files
     for table_id in &source_table_ids {
-        let old_path = config.dir.join(format!("{}.sst", table_id));
+        let old_path = store.sstable_path(*table_id);
         if let Err(e) = std::fs::remove_file(&old_path) {
             tracing::warn!(table_id = table_id, error = %e, "Failed to delete old SSTable file");
         }
@@ -235,6 +233,23 @@ pub async fn compact(state: &LsmState, config: &LsmConfig) -> Result<()> {
         entries_compacted = entry_count,
         "Completed tiered compaction"
     );
+
+    // Validate state consistency after compaction
+    if let Err(e) = store.state.validate_consistency() {
+        tracing::warn!("State inconsistency detected after compaction: {:?}", e);
+    }
+
+    // Debug-only comprehensive validation
+    #[cfg(debug_assertions)]
+    {
+        if let Err(e) = store.state.validate_sstable_id_uniqueness() {
+            tracing::error!("SSTable ID uniqueness violation after compaction: {:?}", e);
+        }
+
+        if let Err(e) = store.state.validate_level_key_ordering() {
+            tracing::error!("Level key ordering violation after compaction: {:?}", e);
+        }
+    }
 
     Ok(())
 }

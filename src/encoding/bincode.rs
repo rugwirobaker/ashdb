@@ -102,7 +102,7 @@ mod tests {
         assert_eq!(int_val, deserialize::<i64>(&serialize(&int_val)).unwrap());
 
         // Test floats
-        let float_val = 3.14f64;
+        let float_val = std::f64::consts::PI;
         assert_eq!(
             float_val,
             deserialize::<f64>(&serialize(&float_val)).unwrap()

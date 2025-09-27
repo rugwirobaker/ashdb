@@ -45,8 +45,9 @@ pub trait Store: Send + Sync {
         self.scan((start, end))
     }
 
-    /// Flushes any pending writes to disk.
-    fn flush(&self) -> Result<()>;
+    /// Synchronizes buffered WAL writes to disk. Writes (set operations) are not
+    /// guaranteed to be durable until this is called.
+    fn sync(&self) -> Result<()>;
 }
 
 pub trait ScanIterator: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}

@@ -9,9 +9,7 @@ pub mod recovery;
 pub mod sstable;
 pub mod state;
 pub mod store;
-pub mod tasks;
 pub mod wal;
-pub mod wal_cleanup;
 
 // Re-export iterator types for use by the main LSM store
 pub use iterator::{HeapEntry, KvIterator, MergeIterator, OwningMemtableIter};
@@ -27,6 +25,3 @@ pub use state::{CompactionGuard, FreezeGuard, LsmState};
 
 // Re-export the main LsmStore struct
 pub use store::LsmStore;
-
-// Re-export background tasks
-pub use tasks::{CompactionTask, FlushTask, MetricsTask, WalCleanupTask};

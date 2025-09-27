@@ -533,7 +533,7 @@ mod tests {
                 let scan_range = start_key..=end_key;
 
                 // Perform the scan
-                let mut scan_iter = table_clone
+                let scan_iter = table_clone
                     .scan(scan_range)
                     .expect("Failed to create scan iterator");
 
@@ -541,7 +541,7 @@ mod tests {
                 let mut last_key = Vec::new();
 
                 // Collect and verify results
-                while let Some(result) = scan_iter.next() {
+                for result in scan_iter {
                     let (key, value) = result.expect("Failed to read entry during concurrent scan");
 
                     // Verify the key-value pair is correct
@@ -664,14 +664,14 @@ mod tests {
                 let end_key = format!("key_{:04}", end_idx - 1).into_bytes();
                 let scan_range = start_key..=end_key;
 
-                let mut scan_iter = table_clone
+                let scan_iter = table_clone
                     .scan(scan_range)
                     .expect("Failed to create scan iterator");
 
                 let mut results = Vec::new();
                 let mut seen_keys = HashSet::new();
 
-                while let Some(result) = scan_iter.next() {
+                for result in scan_iter {
                     let (key, value) = result.expect("Failed to read entry during concurrent scan");
 
                     // Verify key is within expected range
@@ -850,14 +850,14 @@ mod tests {
                 let end_key = format!("key_{:04}", end_idx - 1).into_bytes();
                 let scan_range = start_key..=end_key;
 
-                let mut scan_iter = table_clone
+                let scan_iter = table_clone
                     .scan(scan_range)
                     .expect("Failed to create scan iterator");
 
                 let mut scanned_entries = 0;
                 let mut seen_keys = HashSet::new();
 
-                while let Some(result) = scan_iter.next() {
+                for result in scan_iter {
                     let (key, value) = result.expect("Scan failed");
 
                     // Verify correctness
@@ -1052,7 +1052,7 @@ mod tests {
                                     let mut scan_count = 0;
                                     let mut scan_error = false;
 
-                                    while let Some(result) = scan_iter.next() {
+                                    for result in scan_iter.by_ref() {
                                         match result {
                                             Ok((key, value)) => {
                                                 // Basic verification

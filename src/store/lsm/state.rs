@@ -104,6 +104,162 @@ impl LsmState {
             None
         }
     }
+
+    // ===== STATE VALIDATION METHODS =====
+
+    /// Validate consistency between manifest and in-memory state
+    pub fn validate_consistency(&self) -> crate::error::Result<()> {
+        // Replay manifest to get expected state
+        let manifest_state = {
+            let manifest = self.manifest.read().unwrap();
+            manifest.replay()?
+        };
+
+        let in_memory_levels = self.levels.read().unwrap();
+
+        // Validate level count consistency
+        if manifest_state.levels.len() != in_memory_levels.len() {
+            return Err(crate::Error::InvalidState(format!(
+                "Level count mismatch: manifest has {}, memory has {}",
+                manifest_state.levels.len(),
+                in_memory_levels.len()
+            )));
+        }
+
+        // Validate table count per level
+        for (level_idx, level_meta) in manifest_state.levels.iter().enumerate() {
+            if level_idx < in_memory_levels.len() {
+                let memory_table_count = in_memory_levels[level_idx].table_count();
+                if level_meta.tables.len() != memory_table_count {
+                    return Err(crate::Error::InvalidState(format!(
+                        "Table count mismatch at level {}: manifest has {}, memory has {}",
+                        level_idx,
+                        level_meta.tables.len(),
+                        memory_table_count
+                    )));
+                }
+            }
+        }
+
+        // Validate next table ID consistency
+        let current_max_id = in_memory_levels
+            .iter()
+            .flat_map(|level| &level.sstables)
+            .map(|table| table.id)
+            .max()
+            .unwrap_or(0);
+
+        // Next table ID should be greater than current max, or equal if no tables exist
+        if !in_memory_levels.is_empty() && manifest_state.next_table_id <= current_max_id {
+            return Err(crate::Error::InvalidState(format!(
+                "Next table ID inconsistency: manifest has {}, but max existing ID is {}",
+                manifest_state.next_table_id, current_max_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Check if the state is in a consistent state for operations
+    pub fn is_operation_safe(&self) -> bool {
+        // Check if any critical operations are in progress
+        let compaction_count = self.compaction_running.load(Ordering::SeqCst);
+        let freeze_in_progress = self.freeze_in_progress.load(Ordering::SeqCst);
+        let flush_pending = self.flush_pending.load(Ordering::SeqCst);
+
+        // State is safe if no conflicting operations are running
+        compaction_count == 0 && !freeze_in_progress && !flush_pending
+    }
+
+    /// Get a snapshot of current state metrics for debugging
+    pub fn get_state_metrics(&self) -> StateMetrics {
+        let levels = self.levels.read().unwrap();
+        let frozen_memtables = self.frozen_memtables.read().unwrap();
+        let active_memtable = self.active_memtable.read().unwrap();
+
+        StateMetrics {
+            active_memtable_size: active_memtable.size(),
+            frozen_memtable_count: frozen_memtables.len(),
+            level_count: levels.len(),
+            total_sstable_count: levels.iter().map(|l| l.table_count()).sum(),
+            level_sizes: levels.iter().map(|l| l.size()).collect(),
+            next_sstable_id: self.next_sstable_id.load(Ordering::SeqCst),
+            next_wal_id: self.next_wal_id.load(Ordering::SeqCst),
+            compaction_running: self.compaction_running.load(Ordering::SeqCst),
+            freeze_in_progress: self.freeze_in_progress.load(Ordering::SeqCst),
+            flush_pending: self.flush_pending.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Validate that all SSTable IDs are unique across levels
+    pub fn validate_sstable_id_uniqueness(&self) -> crate::error::Result<()> {
+        let levels = self.levels.read().unwrap();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        for (level_idx, level) in levels.iter().enumerate() {
+            for sstable in &level.sstables {
+                if !seen_ids.insert(sstable.id) {
+                    return Err(crate::Error::InvalidState(format!(
+                        "Duplicate SSTable ID {} found at level {}",
+                        sstable.id, level_idx
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate that keys within each level are properly sorted
+    pub fn validate_level_key_ordering(&self) -> crate::error::Result<()> {
+        let levels = self.levels.read().unwrap();
+
+        for (level_idx, level) in levels.iter().enumerate() {
+            let mut last_max_key: Option<&Vec<u8>> = None;
+
+            for sstable in &level.sstables {
+                // Within each SSTable, min_key should be <= max_key
+                if sstable.min_key > sstable.max_key {
+                    return Err(crate::Error::InvalidState(format!(
+                        "SSTable {} at level {} has min_key > max_key",
+                        sstable.id, level_idx
+                    )));
+                }
+
+                // For Level 0, tables can overlap so we don't check ordering
+                if level_idx > 0 {
+                    // For levels > 0, tables should not overlap
+                    if let Some(last_max) = last_max_key {
+                        if sstable.min_key <= *last_max {
+                            return Err(crate::Error::InvalidState(format!(
+                                "SSTable {} at level {} overlaps with previous table",
+                                sstable.id, level_idx
+                            )));
+                        }
+                    }
+                }
+
+                last_max_key = Some(&sstable.max_key);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Metrics snapshot for debugging and monitoring state
+#[derive(Debug, Clone)]
+pub struct StateMetrics {
+    pub active_memtable_size: usize,
+    pub frozen_memtable_count: usize,
+    pub level_count: usize,
+    pub total_sstable_count: usize,
+    pub level_sizes: Vec<u64>,
+    pub next_sstable_id: u64,
+    pub next_wal_id: u64,
+    pub compaction_running: usize,
+    pub freeze_in_progress: bool,
+    pub flush_pending: bool,
 }
 
 /// RAII guard for compaction operations

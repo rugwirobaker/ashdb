@@ -293,13 +293,13 @@ mod tests {
         assert!(false_encoded < true_encoded);
 
         // Test round-trip
-        assert_eq!(bool::decode(&false_encoded).unwrap(), false);
-        assert_eq!(bool::decode(&true_encoded).unwrap(), true);
+        assert!(!bool::decode(&false_encoded).unwrap());
+        assert!(bool::decode(&true_encoded).unwrap());
     }
 
     #[test]
     fn test_integer_ordering() {
-        let values = vec![-100i64, -1, 0, 1, 100];
+        let values = [-100i64, -1, 0, 1, 100];
         let encoded: Vec<_> = values.iter().map(|v| v.encode()).collect();
 
         // Test that encoded values maintain order
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_float_ordering() {
-        let values = vec![-100.5, -1.0, 0.0, 1.0, 100.5];
+        let values = [-100.5, -1.0, 0.0, 1.0, 100.5];
         let encoded: Vec<_> = values.iter().map(|v| v.encode()).collect();
 
         // Test that encoded values maintain order
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_string_ordering() {
-        let values = vec!["apple", "banana", "cherry"];
+        let values = ["apple", "banana", "cherry"];
         let strings: Vec<String> = values.iter().map(|s| s.to_string()).collect();
         let encoded: Vec<_> = strings.iter().map(|v| v.encode()).collect();
 
@@ -368,7 +368,7 @@ mod tests {
         // Test that types sort in the correct order: bool < i64 < f64 < String < Vec<u8>
         let bool_encoded = true.encode();
         let int_encoded = 42i64.encode();
-        let float_encoded = 3.14f64.encode();
+        let float_encoded = std::f64::consts::PI.encode();
         let string_encoded = "hello".to_string().encode();
         let bytes_encoded = vec![0x01, 0x02].encode();
 
@@ -382,7 +382,10 @@ mod tests {
     fn test_type_prefix_detection() {
         assert_eq!(get_type_prefix(&true.encode()), Some(TYPE_BOOLEAN));
         assert_eq!(get_type_prefix(&42i64.encode()), Some(TYPE_INTEGER));
-        assert_eq!(get_type_prefix(&3.14f64.encode()), Some(TYPE_FLOAT));
+        assert_eq!(
+            get_type_prefix(&std::f64::consts::PI.encode()),
+            Some(TYPE_FLOAT)
+        );
         assert_eq!(
             get_type_prefix(&"hello".to_string().encode()),
             Some(TYPE_STRING)
