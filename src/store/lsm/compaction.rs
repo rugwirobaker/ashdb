@@ -1,3 +1,45 @@
+//! Tiered compaction strategy for LSM-tree space management.
+//!
+//! This module implements tiered compaction, which organizes SSTables into
+//! levels with exponentially increasing size ratios. This strategy was chosen
+//! over leveled compaction for its superior performance on write-heavy workloads.
+//!
+//! # Why Tiered Compaction?
+//!
+//! Tiered compaction offers several advantages for our use case:
+//!
+//! - **Write amplification**: Lower write amplification compared to leveled compaction
+//! - **Write throughput**: Better performance for write-heavy workloads
+//! - **Implementation simplicity**: Easier to implement and reason about
+//! - **Level flexibility**: Each level can contain multiple overlapping SSTables
+//!
+//! According to the RocksDB paper ["RocksDB: Evolution of Development Priorities
+//! in a Key-value Store Serving Large-scale Applications"](https://dl.acm.org/doi/pdf/10.1145/3483840),
+//! tiered compaction provides better write performance for applications that
+//! prioritize write throughput over read latency.
+//!
+//! # Compaction Decision Algorithm
+//!
+//! The algorithm uses a three-tier decision hierarchy:
+//!
+//! 1. **L0 Priority**: Level 0 gets highest priority due to overlapping key ranges
+//! 2. **Size Ratio**: Higher levels compact when size ratio exceeds threshold
+//! 3. **Table Count**: Final level compacts based on table count limit
+//!
+//! ## L0 Special Handling
+//!
+//! Level 0 requires special attention because:
+//! - SSTables can have overlapping key ranges (flushed from memtables)
+//! - Too many L0 tables slow down reads significantly
+//! - L0 compaction merges overlapping tables into non-overlapping L1 tables
+//!
+//! ## Size Ratio Compaction
+//!
+//! For levels 1 and above:
+//! - Each level should be roughly `size_ratio` times larger than the previous
+//! - When a level becomes too large relative to the next, compact it
+//! - This maintains the exponential size growth property
+
 use super::{Level, LsmState, SSTable};
 use crate::{config::CompactionConfig, error::Result};
 

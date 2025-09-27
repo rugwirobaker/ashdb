@@ -1,3 +1,65 @@
+//! Write-Ahead Log (WAL) implementation for durability and recovery.
+//!
+//! The WAL provides crash recovery by logging all mutations before applying them
+//! to the memtable. This ensures that no committed data is lost, even in the
+//! event of sudden process termination or system failure.
+//!
+//! # File Format
+//!
+//! Each WAL file follows this binary format:
+//!
+//! ```text
+//! +------------------+
+//! | Header (64 bytes)|
+//! +------------------+
+//! | Entry 1          |
+//! +------------------+
+//! | Entry 2          |
+//! +------------------+
+//! | ...              |
+//! +------------------+
+//! ```
+//!
+//! ## Entry Format
+//!
+//! Each entry is variable-length and contains:
+//!
+//! ```text
+//! +-----------+-------+-----------+-------+-----------+
+//! |key_len:u32| key   |val_len:u32| value |crc32:u32  |
+//! +-----------+-------+-----------+-------+-----------+
+//! |  4 bytes  |var len|  4 bytes  |var len| 4 bytes   |
+//! +-----------+-------+-----------+-------+-----------+
+//! ```
+//!
+//! - All multi-byte integers use big-endian encoding for portability
+//! - CRC32 checksum covers the entire entry (excluding the checksum itself)
+//! - Delete operations use `val_len = 0` with no value data
+//!
+//! # IO Optimizations for Durability
+//!
+//! ## Direct IO for Write Guarantees
+//!
+//! The most critical optimization is using direct IO (`O_DIRECT`) to ensure
+//! writes reach disk immediately, bypassing kernel page cache:
+//!
+//! - **Durability certainty**: Writes are guaranteed on disk, not buffered in kernel pages
+//! - **No silent data loss**: Eliminates risk of losing "successful" writes during crashes
+//! - **Consistent sync behavior**: `sync()` operations have predictable effects
+//! - **True write-through**: Data persistence doesn't depend on kernel flush timing
+//!
+//! This follows patterns from https://transactional.blog/how-to-learn/disk-io for
+//! reliable database IO. Future implementations may adopt additional patterns
+//! from that resource for even better IO handling.
+//!
+//! ## Write Throughput Optimization
+//!
+//! While maintaining durability, several techniques optimize write performance:
+//! - **Aligned writes**: Uses `AlignedWriter` to meet direct IO alignment requirements
+//! - **Batched operations**: Groups writes to amortize syscall overhead
+//! - **Append-only**: Sequential writes optimize for disk performance
+//! - **Configurable buffering**: Tunable buffer sizes for workload optimization
+
 pub mod aligned_writer;
 pub mod header;
 pub mod recovery;
