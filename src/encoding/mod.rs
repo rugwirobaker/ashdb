@@ -55,6 +55,6 @@ impl std::error::Error for EncodingError {}
 
 impl From<EncodingError> for crate::Error {
     fn from(err: EncodingError) -> Self {
-        crate::Error::InvalidOperation(err.to_string())
+        crate::Error::InvalidInput(err.to_string())
     }
 }

@@ -36,10 +36,15 @@ impl ManifestHeader {
 
     pub fn validate(&self) -> Result<()> {
         if self.magic != *MAGIC {
-            return Err(Error::InvalidManifestMagic);
+            return Err(Error::InvalidData(
+                "Invalid manifest magic number".to_string(),
+            ));
         }
         if self.version != VERSION {
-            return Err(Error::UnsupportedManifestVersion(self.version));
+            return Err(Error::InvalidData(format!(
+                "Unsupported manifest version: {}",
+                self.version
+            )));
         }
         Ok(())
     }
@@ -123,7 +128,7 @@ mod tests {
         buf[0..8].copy_from_slice(b"INVALID!");
 
         let result = ManifestHeader::decode(&buf);
-        assert!(matches!(result, Err(Error::InvalidManifestMagic)));
+        assert!(matches!(result, Err(Error::InvalidData(_))));
     }
 
     #[test]
@@ -133,9 +138,6 @@ mod tests {
         let encoded = header.encode();
 
         let result = ManifestHeader::decode(&encoded);
-        assert!(matches!(
-            result,
-            Err(Error::UnsupportedManifestVersion(999))
-        ));
+        assert!(matches!(result, Err(Error::InvalidData(_))));
     }
 }

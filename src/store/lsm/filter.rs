@@ -161,10 +161,7 @@ mod tests {
 
         let data = vec![
             Ok((b"key_005".to_vec(), b"value_005".to_vec())),
-            Err(Error::Decode(
-                "test error",
-                std::io::Error::new(std::io::ErrorKind::Other, "test"),
-            )),
+            Err(Error::InvalidData("test error".to_string())),
             Ok((b"key_015".to_vec(), b"value_015".to_vec())),
         ];
 

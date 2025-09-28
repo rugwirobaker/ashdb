@@ -128,7 +128,9 @@ impl Wal {
         use std::os::unix::fs::OpenOptionsExt;
 
         if opts.use_direct_io && opts.buffer_size % 4096 != 0 {
-            return Err(Error::InvalidAlignment);
+            return Err(Error::InvalidInput(
+                "Buffer size must be aligned to 4096 bytes for direct IO".to_string(),
+            ));
         }
 
         let mut open_opts = File::options();
@@ -180,7 +182,7 @@ impl Wal {
     pub fn remove(self) -> Result<()> {
         let path = self.path.clone();
         // File handles are dropped here
-        std::fs::remove_file(path).map_err(Error::IoError)
+        Ok(std::fs::remove_file(path)?)
     }
 
     /// Returns the numeric ID of the WAL file, derived from its file name.
@@ -190,7 +192,7 @@ impl Wal {
             .and_then(|name| name.to_str())
             .and_then(|name| name.split('.').next())
             .and_then(|num| num.parse::<u64>().ok())
-            .ok_or_else(|| Error::InvalidWalId(format!("Invalid WAL file name: {:?}", self.path)))
+            .ok_or_else(|| Error::InvalidData(format!("Invalid WAL file name: {:?}", self.path)))
     }
 
     /// Returns the current size of the WAL file.
@@ -215,16 +217,13 @@ impl Wal {
 
         let checksum = CRC32.checksum(&payload);
 
-        let mut writer = self.writer.lock().map_err(|_| Error::MutexPoisoned)?;
+        let mut writer = self.writer.lock()?;
 
         writer.write_u32::<BigEndian>(payload.len() as u32)?;
         writer.write_all(&payload)?;
         writer.write_u32::<BigEndian>(checksum)?;
 
-        self.header
-            .write()
-            .map_err(|_| Error::MutexPoisoned)?
-            .entry_count += 1;
+        self.header.write()?.entry_count += 1;
 
         Ok(())
     }
@@ -235,12 +234,9 @@ impl Wal {
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.writer
-            .lock()
-            .map_err(|_| Error::MutexPoisoned)?
-            .flush()?;
+        self.writer.lock()?.flush()?;
 
-        let header = self.header.read().map_err(|_| Error::MutexPoisoned)?;
+        let header = self.header.read()?;
         let header_bytes = header.encode();
         drop(header);
 
@@ -262,10 +258,7 @@ impl ReplayIterator {
     pub fn new(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
-        reader
-            .get_mut()
-            .seek(SeekFrom::Start(HEADER_SIZE as u64))
-            .map_err(Error::IoError)?;
+        reader.get_mut().seek(SeekFrom::Start(HEADER_SIZE as u64))?;
 
         Ok(ReplayIterator { reader })
     }
@@ -278,21 +271,18 @@ impl ReplayIterator {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Ok(None);
             }
-            Err(e) => return Err(Error::IoError(e)),
+            Err(e) => return Err(e.into()),
         };
 
         let mut payload = vec![0u8; record_len];
         if let Err(e) = reader.read_exact(&mut payload) {
-            return Err(Error::CorruptedWal(format!(
-                "Failed to read payload: {}",
-                e
-            )));
+            return Err(Error::InvalidData(format!("Failed to read payload: {}", e)));
         }
 
         let stored_crc = match reader.read_u32::<BigEndian>() {
             Ok(crc) => crc,
             Err(e) => {
-                return Err(Error::CorruptedWal(format!(
+                return Err(Error::InvalidData(format!(
                     "Failed to read checksum: {}",
                     e
                 )))
@@ -301,7 +291,7 @@ impl ReplayIterator {
 
         let computed_crc = CRC32.checksum(&payload);
         if computed_crc != stored_crc {
-            return Err(Error::ChecksumMismatch);
+            return Err(Error::InvalidData("Checksum mismatch".to_string()));
         }
 
         let mut cursor = Cursor::new(&payload);
@@ -318,13 +308,13 @@ impl ReplayIterator {
 
         let mut key = vec![0u8; key_len];
         if let Err(e) = cursor.read_exact(&mut key) {
-            return Err(Error::CorruptedWal(format!("Failed to read key: {}", e)));
+            return Err(Error::InvalidData(format!("Failed to read key: {}", e)));
         }
 
         let value = if value_len > 0 {
             let mut v = vec![0u8; value_len];
             if let Err(e) = cursor.read_exact(&mut v) {
-                return Err(Error::CorruptedWal(format!("Failed to read value: {}", e)));
+                return Err(Error::InvalidData(format!("Failed to read value: {}", e)));
             }
             Some(v)
         } else {
@@ -434,7 +424,7 @@ mod tests {
 
         for entry in replay_iter {
             match entry {
-                Err(Error::CorruptedWal(_)) | Err(Error::ChecksumMismatch) => {
+                Err(Error::InvalidData(_)) => {
                     has_corruption = true;
                     break;
                 }

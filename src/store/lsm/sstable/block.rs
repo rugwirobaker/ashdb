@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, io, sync::Arc};
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::{error::Result, Error};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -94,10 +94,7 @@ impl Block {
 
         let data_len = data.len();
         if data_len < 4 {
-            return Err(Error::Decode(
-                "block data",
-                io::Error::new(io::ErrorKind::UnexpectedEof, "Data too short"),
-            ));
+            return Err(Error::InvalidData("Block data too short".to_string()));
         }
 
         let num_restarts_offset = data_len - 4;
@@ -106,13 +103,7 @@ impl Block {
 
         let restart_array_size = num_restarts * 4;
         if num_restarts_offset < restart_array_size {
-            return Err(Error::Decode(
-                "block data",
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Data too short for restart positions",
-                ),
-            ));
+            return Err(Error::InvalidData("Data too short for restart positions".to_string()));
         }
 
         let restart_array_offset = num_restarts_offset - restart_array_size;
@@ -178,12 +169,12 @@ impl BlockIterator {
         pos += 4;
 
         if shared_len != 0 {
-            return Err(Error::IndexCorruption(
+            return Err(Error::InvalidData(
                 "Restart point key has a shared prefix".into(),
             ));
         }
         if pos + unshared_len + value_len > data.len() {
-            return Err(Error::IndexCorruption("Entry out of bounds".into()));
+            return Err(Error::InvalidData("Entry out of bounds".into()));
         }
 
         Ok(data[pos..pos + unshared_len].to_vec())
@@ -341,7 +332,7 @@ impl Iterator for BlockIterator {
             ($expr:expr, $field:expr) => {
                 match $expr {
                     Ok(val) => val,
-                    Err(e) => return Some(Err(Error::Decode($field, e))),
+                    Err(e) => return Some(Err(Error::InvalidData(format!("Failed to decode {}: {}", $field, e)))),
                 }
             };
         }
@@ -355,7 +346,7 @@ impl Iterator for BlockIterator {
         pos += 4;
 
         if shared_len > self.last_key.len() || pos + unshared_len + value_len > data.len() {
-            return Some(Err(Error::IndexCorruption(
+            return Some(Err(Error::InvalidData(
                 "Block entry out of bounds".into(),
             )));
         }

@@ -192,7 +192,10 @@ impl VersionEdit {
                 })
             }
 
-            _ => Err(Error::InvalidEditType(edit_type)),
+            _ => Err(Error::InvalidData(format!(
+                "Invalid edit type: {}",
+                edit_type
+            ))),
         }
     }
 }
@@ -279,6 +282,6 @@ mod tests {
     fn test_invalid_edit_type() {
         let invalid_data = vec![0xFF, 0, 0, 0, 0, 0, 0, 0, 0];
         let result = VersionEdit::decode(&invalid_data);
-        assert!(matches!(result, Err(Error::InvalidEditType(0xFF))));
+        assert!(matches!(result, Err(Error::InvalidData(_))));
     }
 }

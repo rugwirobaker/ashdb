@@ -37,7 +37,7 @@ pub(crate) fn recover_state(config: &LsmConfig) -> Result<LsmState> {
     // Validate state consistency after recovery
     if let Err(e) = state.validate_consistency() {
         tracing::error!("Database corruption detected during recovery: {:?}", e);
-        return Err(crate::Error::InvalidState(format!(
+        return Err(crate::Error::InvalidData(format!(
             "Database recovery failed validation: {}",
             e
         )));

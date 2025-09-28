@@ -73,7 +73,7 @@ impl Store for LsmTree {
                     }
                     return Ok(());
                 }
-                Err(crate::Error::Frozen) => {
+                Err(crate::Error::ReadOnly) => {
                     // Retry with new active memtable
                     drop(active);
                     continue;
@@ -417,7 +417,7 @@ mod tests {
 
         // Verify the lock error is what we expect
         match result {
-            Err(crate::Error::LockError(_)) | Err(crate::Error::IoError(_)) => {
+            Err(crate::Error::IO(_)) => {
                 // Expected - file lock should cause a lock or IO error
             }
             Err(other) => {

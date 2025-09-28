@@ -120,7 +120,7 @@ impl LsmState {
 
         // Validate level count consistency
         if manifest_state.levels.len() != in_memory_levels.len() {
-            return Err(crate::Error::InvalidState(format!(
+            return Err(crate::Error::InvalidData(format!(
                 "Level count mismatch: manifest has {}, memory has {}",
                 manifest_state.levels.len(),
                 in_memory_levels.len()
@@ -132,7 +132,7 @@ impl LsmState {
             if level_idx < in_memory_levels.len() {
                 let memory_table_count = in_memory_levels[level_idx].table_count();
                 if level_meta.tables.len() != memory_table_count {
-                    return Err(crate::Error::InvalidState(format!(
+                    return Err(crate::Error::InvalidData(format!(
                         "Table count mismatch at level {}: manifest has {}, memory has {}",
                         level_idx,
                         level_meta.tables.len(),
@@ -152,7 +152,7 @@ impl LsmState {
 
         // Next table ID should be greater than current max, or equal if no tables exist
         if !in_memory_levels.is_empty() && manifest_state.next_table_id <= current_max_id {
-            return Err(crate::Error::InvalidState(format!(
+            return Err(crate::Error::InvalidData(format!(
                 "Next table ID inconsistency: manifest has {}, but max existing ID is {}",
                 manifest_state.next_table_id, current_max_id
             )));
@@ -200,7 +200,7 @@ impl LsmState {
         for (level_idx, level) in levels.iter().enumerate() {
             for sstable in &level.sstables {
                 if !seen_ids.insert(sstable.id) {
-                    return Err(crate::Error::InvalidState(format!(
+                    return Err(crate::Error::InvalidData(format!(
                         "Duplicate SSTable ID {} found at level {}",
                         sstable.id, level_idx
                     )));
@@ -221,7 +221,7 @@ impl LsmState {
             for sstable in &level.sstables {
                 // Within each SSTable, min_key should be <= max_key
                 if sstable.min_key > sstable.max_key {
-                    return Err(crate::Error::InvalidState(format!(
+                    return Err(crate::Error::InvalidData(format!(
                         "SSTable {} at level {} has min_key > max_key",
                         sstable.id, level_idx
                     )));
@@ -232,7 +232,7 @@ impl LsmState {
                     // For levels > 0, tables should not overlap
                     if let Some(last_max) = last_max_key {
                         if sstable.min_key <= *last_max {
-                            return Err(crate::Error::InvalidState(format!(
+                            return Err(crate::Error::InvalidData(format!(
                                 "SSTable {} at level {} overlaps with previous table",
                                 sstable.id, level_idx
                             )));
