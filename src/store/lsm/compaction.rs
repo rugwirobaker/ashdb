@@ -147,7 +147,7 @@ pub async fn compact(store: &super::LsmTree) -> Result<()> {
                 .sstables
                 .iter()
                 .find(|s| s.id == table_meta.id)
-                .ok_or_else(|| crate::Error::InvalidOperation("SSTable not found".to_string()))?;
+                .ok_or_else(|| crate::Error::InvalidData("SSTable not found".to_string()))?;
 
             let scan_iter = sstable.table.scan(..)?;
             let boxed_iter: LSMIterator = Box::new(scan_iter);

@@ -107,7 +107,7 @@ impl Scheduler {
         // Wait for all tasks to complete
         for task in tasks {
             task.await
-                .map_err(|e| crate::Error::InvalidState(format!("Task join error: {}", e)))?;
+?;
         }
 
         Ok(())

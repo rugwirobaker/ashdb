@@ -119,7 +119,7 @@ impl Memtable {
     /// Inserts or updates a key-value pair in the Memtable.
     pub fn put(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
         if self.frozen.load(Ordering::SeqCst) {
-            return Err(Error::Frozen);
+            return Err(Error::ReadOnly);
         }
         let key_size = key.len();
         let value_size = value.as_ref().map_or(0, |v| v.len());
@@ -147,7 +147,7 @@ impl Memtable {
     /// freeze prevents further writes to the Memtable.
     pub fn freeze(&self) -> Result<()> {
         if self.frozen.swap(true, Ordering::SeqCst) {
-            return Err(Error::Frozen);
+            return Err(Error::ReadOnly);
         }
         Ok(())
     }
@@ -202,7 +202,7 @@ impl Memtable {
                         table.add_block(&block_data, first_key)?;
                     }
                     None => {
-                        return Err(Error::InvalidState(
+                        return Err(Error::InvalidData(
                             "First key in block is missing".to_string(),
                         ));
                     }
@@ -220,7 +220,7 @@ impl Memtable {
                     table.add_block(&block_data, first_key)?;
                 }
                 None => {
-                    return Err(Error::InvalidState(
+                    return Err(Error::InvalidData(
                         "First key in block is missing".to_string(),
                     ));
                 }
@@ -340,7 +340,7 @@ mod tests {
         // Freeze the Memtable once
         memtable.freeze().expect("Failed to freeze Memtable");
         // Attempt to freeze it again and verify the error
-        assert!(matches!(memtable.freeze(), Err(Error::Frozen)));
+        assert!(matches!(memtable.freeze(), Err(Error::ReadOnly)));
     }
 
     #[test]
@@ -353,7 +353,7 @@ mod tests {
         // Attempt to write and verify the error
         assert!(matches!(
             memtable.put(b"key1".to_vec(), Some(b"value1".to_vec())),
-            Err(Error::Frozen)
+            Err(Error::ReadOnly)
         ));
     }
 

@@ -1,77 +1,94 @@
-use std::io;
+use std::fmt::Display;
 
-pub type Result<T> = std::result::Result<T, Error>;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
+/// AshDB errors.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Error {
-    IoError(io::Error),
-    InvalidHeader,
-    Decode(&'static str, io::Error),
-    Encode(&'static str, io::Error),
-    CorruptedWal(String),
-    InvalidChecksum,
-    ChecksumMismatch,
-    MutexPoisoned, // From WAL-related concurrency handling
-    KeyNotFound,   // From LSM store
-    Frozen,
-    InvalidWalId(String),
-    InvalidState(String),
-    // New variants
-    ReadError(&'static str, io::Error),
-    WriteError(&'static str, io::Error),
-    IndexCorruption(String),
-    LockError(io::Error),
-    InvalidOperation(String),
-    InvalidRecordType(u8),
-    InvalidOperationType(u8),
-    InvalidWalMagic,
-    UnsupportedWalVersion(u32),
-    InvalidAlignment,
-    InvalidManifestMagic,
-    UnsupportedManifestVersion(u32),
-    InvalidEditType(u8),
-    CorruptedManifest(String),
+    /// The operation was aborted and must be retried. This typically happens
+    /// with system state changes that require operation retry.
+    Abort,
+    /// Invalid data, typically decoding errors, corruption, or unexpected internal values.
+    InvalidData(String),
+    /// Invalid user input, typically parser or query errors.
+    InvalidInput(String),
+    /// An IO error.
+    IO(String),
+    /// A write was attempted on a read-only structure (frozen memtable, SSTable, etc.).
+    ReadOnly,
+    /// A write transaction conflicted with a different writer and lost. The
+    /// transaction must be retried.
+    Serialization,
 }
 
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Self {
-        Error::IoError(err)
-    }
-}
+impl std::error::Error for Error {}
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::IoError(err) => write!(f, "I/O error: {}", err),
-            Error::InvalidHeader => write!(f, "Invalid header"),
-            Error::Decode(field, err) => write!(f, "Failed to decode {}: {}", field, err),
-            Error::Encode(field, err) => write!(f, "Failed to encode {}: {}", field, err),
-            Error::CorruptedWal(msg) => write!(f, "Corrupted WAL: {}", msg),
-            Error::InvalidChecksum => write!(f, "Invalid checksum"),
-            Error::ChecksumMismatch => write!(f, "Checksum mismatch"),
-            Error::MutexPoisoned => write!(f, "Mutex was poisoned"),
-            Error::Frozen => write!(f, "Memtable is frozen"),
-            Error::KeyNotFound => write!(f, "Key not found"),
-            Error::InvalidWalId(msg) => write!(f, "Invalid WAL ID: {}", msg),
-            Error::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
-            Error::ReadError(context, err) => write!(f, "Failed to read {}: {}", context, err),
-            Error::WriteError(context, err) => write!(f, "Failed to write {}: {}", context, err),
-            Error::IndexCorruption(msg) => write!(f, "Index corruption: {}", msg),
-            Error::LockError(err) => write!(f, "Lock error: {}", err),
-            Error::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
-            Error::InvalidRecordType(t) => write!(f, "Invalid record type: {}", t),
-            Error::InvalidOperationType(t) => write!(f, "Invalid operation type: {}", t),
-            Error::InvalidWalMagic => write!(f, "Invalid WAL magic number"),
-            Error::UnsupportedWalVersion(v) => write!(f, "Unsupported WAL version: {}", v),
-            Error::InvalidAlignment => write!(f, "Invalid alignment for O_DIRECT"),
-            Error::InvalidManifestMagic => write!(f, "Invalid manifest magic number"),
-            Error::UnsupportedManifestVersion(v) => {
-                write!(f, "Unsupported manifest version: {}", v)
-            }
-            Error::InvalidEditType(t) => write!(f, "Invalid edit type: {}", t),
-            Error::CorruptedManifest(msg) => write!(f, "Corrupted manifest: {}", msg),
+            Error::Abort => write!(f, "operation aborted"),
+            Error::InvalidData(msg) => write!(f, "invalid data: {msg}"),
+            Error::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
+            Error::IO(msg) => write!(f, "io error: {msg}"),
+            Error::ReadOnly => write!(f, "write attempted on read-only structure"),
+            Error::Serialization => write!(f, "serialization failure, retry transaction"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+/// Constructs an Error::InvalidData for the given format string.
+#[macro_export]
+macro_rules! errdata {
+    ($($args:tt)*) => { $crate::error::Error::InvalidData(format!($($args)*)).into() };
+}
+
+/// Constructs an Error::InvalidInput for the given format string.
+#[macro_export]
+macro_rules! errinput {
+    ($($args:tt)*) => { $crate::error::Error::InvalidInput(format!($($args)*)).into() };
+}
+
+/// An AshDB Result returning Error.
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl<T> From<Error> for Result<T> {
+    fn from(error: Error) -> Self {
+        Err(error)
+    }
+}
+
+impl serde::de::Error for Error {
+    fn custom<T: Display>(msg: T) -> Self {
+        Error::InvalidData(msg.to_string())
+    }
+}
+
+impl serde::ser::Error for Error {
+    fn custom<T: Display>(msg: T) -> Self {
+        Error::InvalidData(msg.to_string())
+    }
+}
+
+impl From<Box<bincode::ErrorKind>> for Error {
+    fn from(err: Box<bincode::ErrorKind>) -> Self {
+        Error::InvalidData(err.to_string())
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::IO(err.to_string())
+    }
+}
+
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(err: std::sync::PoisonError<T>) -> Self {
+        Error::IO(err.to_string())
+    }
+}
+
+impl From<tokio::task::JoinError> for Error {
+    fn from(err: tokio::task::JoinError) -> Self {
+        Error::IO(err.to_string())
+    }
+}

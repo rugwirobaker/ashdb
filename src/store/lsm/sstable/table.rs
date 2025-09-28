@@ -85,9 +85,7 @@ impl Table {
     pub fn add_block(&mut self, block_data: &[u8], first_key: Vec<u8>) -> Result<()> {
         match self {
             Table::Writable(writable) => writable.add_block(block_data, first_key),
-            Table::Readable(_) => Err(Error::InvalidOperation(
-                "Cannot add block to a readable table".to_string(),
-            )),
+            Table::Readable(_) => Err(Error::ReadOnly),
         }
     }
 
@@ -102,9 +100,7 @@ impl Table {
     pub fn finalize(&mut self) -> Result<Table> {
         match self {
             Table::Writable(writable) => writable.finalize(),
-            Table::Readable(_) => Err(Error::InvalidOperation(
-                "Cannot finalize a readable table".to_string(),
-            )),
+            Table::Readable(_) => Err(Error::ReadOnly),
         }
     }
 
@@ -116,9 +112,9 @@ impl Table {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self {
             Table::Readable(readable) => readable.get(key),
-            Table::Writable(_) => Err(Error::InvalidOperation(
-                "Cannot get from a writable table".to_string(),
-            )),
+            // TODO: This error doesn't make logical sense - writable table isn't read-only.
+            // Consider better error variant or change implementation to allow reading from writable tables.
+            Table::Writable(_) => Err(Error::ReadOnly),
         }
     }
 
@@ -133,9 +129,9 @@ impl Table {
     {
         match self {
             Table::Readable(readable) => readable.scan(range),
-            Table::Writable(_) => Err(Error::InvalidOperation(
-                "Cannot scan a writable table".to_string(),
-            )),
+            // TODO: This error doesn't make logical sense - writable table isn't read-only.
+            // Consider better error variant or change implementation to allow reading from writable tables.
+            Table::Writable(_) => Err(Error::ReadOnly),
         }
     }
 }

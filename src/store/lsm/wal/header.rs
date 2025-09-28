@@ -26,10 +26,13 @@ impl Header {
 
     pub fn validate(&self) -> Result<()> {
         if self.magic != *MAGIC {
-            return Err(Error::InvalidWalMagic);
+            return Err(Error::InvalidData("Invalid WAL magic number".to_string()));
         }
         if self.version != VERSION {
-            return Err(Error::UnsupportedWalVersion(self.version));
+            return Err(Error::InvalidData(format!(
+                "Unsupported WAL version: {}",
+                self.version
+            )));
         }
         Ok(())
     }
@@ -57,7 +60,7 @@ impl TryFrom<&[u8]> for Header {
 
     fn try_from(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < HEADER_SIZE {
-            return Err(Error::InvalidHeader);
+            return Err(Error::InvalidData("Invalid header".to_string()));
         }
         Header::decode(&bytes[..HEADER_SIZE].try_into().unwrap())
     }
@@ -125,7 +128,7 @@ mod tests {
         (&mut buf[12..20]).write_u64::<BigEndian>(0).unwrap();
 
         let result = Header::decode(&buf);
-        assert!(matches!(result, Err(Error::InvalidWalMagic)));
+        assert!(matches!(result, Err(Error::InvalidData(_))));
     }
 
     #[test]
@@ -136,7 +139,7 @@ mod tests {
         (&mut buf[12..20]).write_u64::<BigEndian>(0).unwrap();
 
         let result = Header::decode(&buf);
-        assert!(matches!(result, Err(Error::UnsupportedWalVersion(999))));
+        assert!(matches!(result, Err(Error::InvalidData(_))));
     }
 
     #[test]
@@ -145,8 +148,8 @@ mod tests {
         let result = Header::try_from(&invalid_data[..]);
         assert!(result.is_err());
         match result {
-            Err(Error::InvalidHeader) => {}
-            _ => panic!("Expected InvalidHeader error"),
+            Err(Error::InvalidData(_)) => {}
+            _ => panic!("Expected InvalidData error"),
         }
     }
 }

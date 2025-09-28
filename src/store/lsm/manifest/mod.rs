@@ -120,7 +120,7 @@ impl Manifest {
         let edit_bytes = edit.encode();
         let checksum = CRC32.checksum(&edit_bytes);
 
-        let mut writer = self.writer.lock().map_err(|_| Error::MutexPoisoned)?;
+        let mut writer = self.writer.lock()?;
 
         writer.write_u32::<BigEndian>(edit_bytes.len() as u32)?;
         writer.write_all(&edit_bytes)?;
@@ -128,7 +128,7 @@ impl Manifest {
 
         let seq = edit.seq();
         let snapshot_interval = {
-            let mut header = self.header.write().map_err(|_| Error::MutexPoisoned)?;
+            let mut header = self.header.write()?;
             header.current_seq = header.current_seq.max(seq);
             header.snapshot_interval
         };
@@ -145,10 +145,10 @@ impl Manifest {
     pub fn sync(&self) -> Result<()> {
         self.writer
             .lock()
-            .map_err(|_| Error::MutexPoisoned)?
+?
             .flush()?;
 
-        let header = self.header.read().map_err(|_| Error::MutexPoisoned)?;
+        let header = self.header.read()?;
         let header_bytes = header.encode();
         drop(header);
 
@@ -321,7 +321,7 @@ impl Iterator for ManifestIterator {
         let computed_checksum = CRC32.checksum(&edit_bytes);
 
         if computed_checksum != stored_checksum {
-            return Some(Err(Error::ChecksumMismatch));
+            return Some(Err(Error::InvalidData("Checksum mismatch".to_string())));
         }
 
         Some(VersionEdit::decode(&edit_bytes))
@@ -723,7 +723,7 @@ mod tests {
         // Should detect checksum corruption
         let result = iter.next();
         match result {
-            Some(Err(Error::ChecksumMismatch)) => {
+            Some(Err(Error::InvalidData(msg))) if msg.contains("Checksum") => {
                 // Expected: checksum mismatch detected
             }
             Some(Ok(_)) => {
@@ -876,7 +876,7 @@ mod tests {
         // Second entry should be invalid
         let second = iter.next();
         match second {
-            Some(Err(Error::InvalidEditType(0xFF))) => {
+            Some(Err(Error::InvalidData(msg))) if msg.contains("Invalid edit type") => {
                 // Expected: invalid edit type detected
             }
             Some(Ok(_)) => {

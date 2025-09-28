@@ -212,22 +212,22 @@ impl TryFrom<&[u8]> for Index {
             // Read key length (u16)
             let key_len = cursor
                 .read_u16::<BigEndian>()
-                .map_err(|e| Error::ReadError("key length in index block", e))?
+?
                 as usize;
 
             // Read key bytes
             let mut key = vec![0u8; key_len];
             cursor
                 .read_exact(&mut key)
-                .map_err(|e| Error::ReadError("key in index block", e))?;
+?;
 
             let block_offset = cursor
                 .read_u64::<BigEndian>()
-                .map_err(|e| Error::ReadError("block offset in index block", e))?;
+?;
 
             let block_size = cursor
                 .read_u64::<BigEndian>()
-                .map_err(|e| Error::ReadError("block size in index block", e))?;
+?;
 
             entries.push((key, block_offset, block_size));
         }
