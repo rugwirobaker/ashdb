@@ -71,7 +71,7 @@ pub mod state;
 pub mod store;
 pub mod wal;
 
-pub use iterator::{HeapEntry, LSMIterator, LSMScanIterator};
+pub use iterator::{HeapEntry, LSMIterator, LsmIterator};
 pub use manifest::{Level, SSTable};
 pub use memtable::{ActiveMemtable, FrozenMemtable, Memtable, ScanIterator, MAX_MEMTABLE_SIZE};
 pub use state::{CompactionGuard, FreezeGuard, LsmState};

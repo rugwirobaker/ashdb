@@ -48,6 +48,10 @@ impl ActiveMemtable {
         self.memtable.put(key, value)
     }
 
+    pub fn delete(&self, key: Vec<u8>) -> Result<()> {
+        self.memtable.delete(key)
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
         self.memtable.get(key)
     }

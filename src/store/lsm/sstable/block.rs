@@ -1,9 +1,34 @@
+use std::io::{Read, Seek, SeekFrom};
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::{error::Result, Error};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 const RESTART_INTERVAL: usize = 16;
+
+/// Operation type for SSTable entries
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpType {
+    Put = 0x00,
+    Delete = 0x01,
+}
+
+impl OpType {
+    fn from_byte(byte: u8) -> Result<Self> {
+        match byte {
+            0x00 => Ok(OpType::Put),
+            0x01 => Ok(OpType::Delete),
+            _ => Err(Error::InvalidData(format!(
+                "Unknown operation type: {}",
+                byte
+            ))),
+        }
+    }
+
+    fn to_byte(self) -> u8 {
+        self as u8
+    }
+}
 
 // --- Builder (No changes needed) ---
 pub struct Builder {
@@ -24,7 +49,7 @@ impl Builder {
         }
     }
 
-    pub fn add_entry(&mut self, key: &[u8], value: &[u8]) {
+    pub fn add_entry(&mut self, key: &[u8], value: Option<&[u8]>) {
         let shared_prefix_len = if self.entry_count % RESTART_INTERVAL == 0 {
             self.restart_positions.push(self.buffer.len() as u32);
             0
@@ -33,19 +58,26 @@ impl Builder {
         };
 
         let unshared_key_len = key.len() - shared_prefix_len;
+        let op_type = if value.is_some() {
+            OpType::Put
+        } else {
+            OpType::Delete
+        };
+        let value_len = value.map_or(0, |v| v.len());
 
-        let mut entry_buf = Vec::with_capacity(8 + unshared_key_len + value.len());
+        let mut entry_buf = Vec::with_capacity(9 + unshared_key_len + value_len);
         entry_buf
             .write_u16::<BigEndian>(shared_prefix_len as u16)
             .unwrap();
         entry_buf
             .write_u16::<BigEndian>(unshared_key_len as u16)
             .unwrap();
-        entry_buf
-            .write_u32::<BigEndian>(value.len() as u32)
-            .unwrap();
+        entry_buf.write_u8(op_type.to_byte()).unwrap();
+        entry_buf.write_u32::<BigEndian>(value_len as u32).unwrap();
         entry_buf.extend_from_slice(&key[shared_prefix_len..]);
-        entry_buf.extend_from_slice(value);
+        if let Some(v) = value {
+            entry_buf.extend_from_slice(v);
+        }
 
         self.buffer.extend_from_slice(&entry_buf);
 
@@ -125,7 +157,7 @@ impl Block {
         let mut iter = Arc::new(self.clone()).iter();
         iter.seek(key)?;
         match iter.next() {
-            Some(Ok((found_key, value))) if found_key == key => Ok(Some(value)),
+            Some(Ok((found_key, value))) if found_key == key => Ok(value),
             _ => Ok(None),
         }
     }
@@ -167,6 +199,8 @@ impl BlockIterator {
         pos += 2;
         let unshared_len = (&data[pos..]).read_u16::<BigEndian>()? as usize;
         pos += 2;
+        let _op_type = OpType::from_byte((&data[pos..]).read_u8()?)?;
+        pos += 1;
         let value_len = (&data[pos..]).read_u32::<BigEndian>()? as usize;
         pos += 4;
 
@@ -279,8 +313,6 @@ impl MultiBlockIterator {
             return Ok(());
         }
 
-        use std::io::{Read, Seek, SeekFrom};
-
         // Get the current block's offset and size
         let (offset, size) = self.blocks[self.current_block_index];
 
@@ -298,7 +330,7 @@ impl MultiBlockIterator {
 }
 
 impl Iterator for MultiBlockIterator {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
+    type Item = Result<(Vec<u8>, Option<Vec<u8>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -321,7 +353,7 @@ impl Iterator for MultiBlockIterator {
 }
 
 impl Iterator for BlockIterator {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
+    type Item = Result<(Vec<u8>, Option<Vec<u8>>)>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_offset >= self.block.data.len() {
             return None;
@@ -349,6 +381,9 @@ impl Iterator for BlockIterator {
         let unshared_len =
             try_read!((&data[pos..]).read_u16::<BigEndian>(), "unshared_len") as usize;
         pos += 2;
+        let op_type_byte = try_read!((&data[pos..]).read_u8(), "op_type");
+        let op_type = try_read!(OpType::from_byte(op_type_byte), "op_type");
+        pos += 1;
         let value_len = try_read!((&data[pos..]).read_u32::<BigEndian>(), "value_len") as usize;
         pos += 4;
 
@@ -361,7 +396,10 @@ impl Iterator for BlockIterator {
         key.extend_from_slice(&data[pos..pos + unshared_len]);
         pos += unshared_len;
 
-        let value = data[pos..pos + value_len].to_vec();
+        let value = match op_type {
+            OpType::Delete => None, // Return None for tombstones
+            OpType::Put => Some(data[pos..pos + value_len].to_vec()),
+        };
         pos += value_len;
 
         self.current_offset = pos;
@@ -387,7 +425,7 @@ mod tests {
         ];
 
         for (key, value) in &entries {
-            builder.add_entry(key, value);
+            builder.add_entry(key, Some(value));
         }
         let block_data = builder.finish();
         let block = Arc::new(Block::new(block_data).expect("Failed to create block"));

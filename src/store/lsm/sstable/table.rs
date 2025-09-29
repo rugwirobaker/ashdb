@@ -282,7 +282,7 @@ mod tests {
                 first_key_in_block = Some(key.clone());
             }
 
-            builder.add_entry(key, value);
+            builder.add_entry(key, Some(value));
 
             if builder.len() >= 2 {
                 let block_data = builder.finish();
@@ -350,7 +350,7 @@ mod tests {
                 first_key_in_block = Some(key.clone());
             }
 
-            builder.add_entry(key, value);
+            builder.add_entry(key, Some(value));
 
             // Flush block when it reaches a certain size to create multiple blocks
             if builder.len() >= 256 {
@@ -396,7 +396,7 @@ mod tests {
                 .expect("Iterator ended prematurely; missing entry")
                 .expect("Iterator returned an error");
             assert_eq!(key, expected_key);
-            assert_eq!(value, expected_value);
+            assert_eq!(value, Some(expected_value));
         }
 
         // Ensure the iterator is now exhausted
@@ -430,7 +430,7 @@ mod tests {
                 first_key_in_block = Some(key.clone());
             }
 
-            builder.add_entry(key, value);
+            builder.add_entry(key, Some(value));
         }
 
         let block_data = builder.finish();
@@ -478,7 +478,7 @@ mod tests {
             if first_key_in_block.is_none() {
                 first_key_in_block = Some(key.clone());
             }
-            builder.add_entry(key, value);
+            builder.add_entry(key, Some(value));
 
             // Flush block when it reaches a certain size to create multiple blocks
             if builder.len() >= 256 {
@@ -544,7 +544,7 @@ mod tests {
                     let expected_value = format!("value_{:04}", start_idx + count).into_bytes();
                     assert_eq!(
                         value,
-                        expected_value,
+                        Some(expected_value),
                         "Task {} got incorrect value for key {:?}",
                         task_id,
                         String::from_utf8_lossy(&key)
@@ -616,7 +616,7 @@ mod tests {
             if first_key_in_block.is_none() {
                 first_key_in_block = Some(key.clone());
             }
-            builder.add_entry(key, value);
+            builder.add_entry(key, Some(value));
 
             if builder.len() >= 256 {
                 let block_data = builder.finish();
@@ -756,7 +756,7 @@ mod tests {
             if first_key_in_block.is_none() {
                 first_key_in_block = Some(key.clone());
             }
-            builder.add_entry(key, value);
+            builder.add_entry(key, Some(value));
 
             if builder.len() >= 256 {
                 let block_data = builder.finish();
@@ -862,9 +862,11 @@ mod tests {
                         if let Ok(key_idx) = key_num.parse::<usize>() {
                             let expected_value = format!("value_{:04}", key_idx).into_bytes();
                             assert_eq!(
-                                value, expected_value,
+                                value,
+                                Some(expected_value),
                                 "Scan task {} got wrong value for key {:?}",
-                                task_id, key_str
+                                task_id,
+                                key_str
                             );
                         }
                     }
@@ -956,7 +958,7 @@ mod tests {
             if first_key_in_block.is_none() {
                 first_key_in_block = Some(key.clone());
             }
-            builder.add_entry(key, value);
+            builder.add_entry(key, Some(value));
 
             if builder.len() >= 1024 {
                 // Larger blocks to create more file I/O
@@ -1015,9 +1017,11 @@ mod tests {
                                         format!("value_{:05}_{}", key_idx, "x".repeat(50))
                                             .into_bytes();
                                     assert_eq!(
-                                        value, expected_value,
+                                        value,
+                                        expected_value,
                                         "Task {} get operation got wrong value for key {}",
-                                        task_id, key_idx
+                                        task_id,
+                                        key_idx
                                     );
                                     successful_operations += 1;
                                 }
@@ -1065,7 +1069,7 @@ mod tests {
                                                                 "x".repeat(50)
                                                             )
                                                             .into_bytes();
-                                                            if value != expected_value {
+                                                            if value != Some(expected_value) {
                                                                 eprintln!("Task {} scan got wrong value for key {}", task_id, key_idx);
                                                             }
                                                         }

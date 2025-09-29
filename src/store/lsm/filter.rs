@@ -20,7 +20,7 @@ use std::ops::{Bound, RangeBounds};
 /// ```
 pub struct RangeFilter<I, R>
 where
-    I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
+    I: Iterator<Item = Result<(Vec<u8>, Option<Vec<u8>>)>>,
     R: RangeBounds<Vec<u8>> + Send + Sync,
 {
     inner: I,
@@ -29,7 +29,7 @@ where
 
 impl<I, R> RangeFilter<I, R>
 where
-    I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
+    I: Iterator<Item = Result<(Vec<u8>, Option<Vec<u8>>)>>,
     R: RangeBounds<Vec<u8>> + Send + Sync,
 {
     /// Create a new range filter that wraps the given iterator.
@@ -84,10 +84,10 @@ where
 
 impl<I, R> Iterator for RangeFilter<I, R>
 where
-    I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
+    I: Iterator<Item = Result<(Vec<u8>, Option<Vec<u8>>)>>,
     R: RangeBounds<Vec<u8>> + Send + Sync,
 {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
+    type Item = Result<(Vec<u8>, Option<Vec<u8>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -115,11 +115,11 @@ mod tests {
     #[test]
     fn test_range_filter_inclusive() {
         let data = vec![
-            Ok((b"key_005".to_vec(), b"value_005".to_vec())),
-            Ok((b"key_010".to_vec(), b"value_010".to_vec())),
-            Ok((b"key_015".to_vec(), b"value_015".to_vec())),
-            Ok((b"key_020".to_vec(), b"value_020".to_vec())),
-            Ok((b"key_025".to_vec(), b"value_025".to_vec())),
+            Ok((b"key_005".to_vec(), Some(b"value_005".to_vec()))),
+            Ok((b"key_010".to_vec(), Some(b"value_010".to_vec()))),
+            Ok((b"key_015".to_vec(), Some(b"value_015".to_vec()))),
+            Ok((b"key_020".to_vec(), Some(b"value_020".to_vec()))),
+            Ok((b"key_025".to_vec(), Some(b"value_025".to_vec()))),
         ];
 
         let iter = data.into_iter();
@@ -137,11 +137,11 @@ mod tests {
     #[test]
     fn test_range_filter_exclusive() {
         let data = vec![
-            Ok((b"key_005".to_vec(), b"value_005".to_vec())),
-            Ok((b"key_010".to_vec(), b"value_010".to_vec())),
-            Ok((b"key_015".to_vec(), b"value_015".to_vec())),
-            Ok((b"key_020".to_vec(), b"value_020".to_vec())),
-            Ok((b"key_025".to_vec(), b"value_025".to_vec())),
+            Ok((b"key_005".to_vec(), Some(b"value_005".to_vec()))),
+            Ok((b"key_010".to_vec(), Some(b"value_010".to_vec()))),
+            Ok((b"key_015".to_vec(), Some(b"value_015".to_vec()))),
+            Ok((b"key_020".to_vec(), Some(b"value_020".to_vec()))),
+            Ok((b"key_025".to_vec(), Some(b"value_025".to_vec()))),
         ];
 
         let iter = data.into_iter();
@@ -160,9 +160,9 @@ mod tests {
         use crate::Error;
 
         let data = vec![
-            Ok((b"key_005".to_vec(), b"value_005".to_vec())),
+            Ok((b"key_005".to_vec(), Some(b"value_005".to_vec()))),
             Err(Error::InvalidData("test error".to_string())),
-            Ok((b"key_015".to_vec(), b"value_015".to_vec())),
+            Ok((b"key_015".to_vec(), Some(b"value_015".to_vec()))),
         ];
 
         let iter = data.into_iter();

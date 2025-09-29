@@ -134,6 +134,11 @@ impl Memtable {
         Ok(())
     }
 
+    /// Deletes a key by inserting a tombstone.
+    pub fn delete(&self, key: Vec<u8>) -> Result<()> {
+        self.put(key, None)
+    }
+
     /// Retrieves the value for a given key.
     pub fn get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
         self.data.get(key).map(|entry| entry.value().clone())
@@ -184,14 +189,14 @@ impl Memtable {
 
         for entry in self.data.iter() {
             let key = entry.key();
-            let value = entry.value().clone().unwrap_or_default();
+            let value = entry.value().clone(); // Keep as Option<Vec<u8>>
 
             // If this is the first entry in the block, record the key
             if first_key_in_block.is_none() {
                 first_key_in_block = Some(key.clone());
             }
 
-            builder.add_entry(key, &value);
+            builder.add_entry(key, value.as_deref());
 
             // Check if the block size exceeds the limit (e.g., 4KB)
             if builder.len() >= table::MAX_BLOCK_SIZE {
@@ -249,7 +254,7 @@ impl MemtableIterator {
 }
 
 impl Iterator for MemtableIterator {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
+    type Item = Result<(Vec<u8>, Option<Vec<u8>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.exhausted {
@@ -273,7 +278,7 @@ impl Iterator for MemtableIterator {
         match range_iter.next() {
             Some(entry) => {
                 let key = entry.key().clone();
-                let value = entry.value().clone().unwrap_or_default();
+                let value = entry.value().clone(); // Keep as Option<Vec<u8>>
                 self.current_key = Some(key.clone());
                 Some(Ok((key, value)))
             }
@@ -406,13 +411,13 @@ mod tests {
             .next()
             .expect("Expected first result")
             .expect("Error in first result");
-        assert_eq!(first, (b"key1".to_vec(), b"value1".to_vec()));
+        assert_eq!(first, (b"key1".to_vec(), Some(b"value1".to_vec())));
 
         let second = scan_iter
             .next()
             .expect("Expected second result")
             .expect("Error in second result");
-        assert_eq!(second, (b"key2".to_vec(), b"value2".to_vec()));
+        assert_eq!(second, (b"key2".to_vec(), Some(b"value2".to_vec())));
 
         assert!(scan_iter.next().is_none(), "Expected no more results");
     }
