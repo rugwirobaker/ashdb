@@ -69,8 +69,14 @@ impl serde::ser::Error for Error {
     }
 }
 
-impl From<Box<bincode::ErrorKind>> for Error {
-    fn from(err: Box<bincode::ErrorKind>) -> Self {
+impl From<bincode::error::DecodeError> for Error {
+    fn from(err: bincode::error::DecodeError) -> Self {
+        Error::InvalidData(err.to_string())
+    }
+}
+
+impl From<bincode::error::EncodeError> for Error {
+    fn from(err: bincode::error::EncodeError) -> Self {
         Error::InvalidData(err.to_string())
     }
 }
@@ -90,5 +96,23 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 impl From<tokio::task::JoinError> for Error {
     fn from(err: tokio::task::JoinError) -> Self {
         Error::IO(err.to_string())
+    }
+}
+
+impl From<std::num::TryFromIntError> for Error {
+    fn from(err: std::num::TryFromIntError) -> Self {
+        Error::InvalidData(err.to_string())
+    }
+}
+
+impl From<std::array::TryFromSliceError> for Error {
+    fn from(err: std::array::TryFromSliceError) -> Self {
+        Error::InvalidData(err.to_string())
+    }
+}
+
+impl From<std::string::FromUtf8Error> for Error {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        Error::InvalidData(err.to_string())
     }
 }

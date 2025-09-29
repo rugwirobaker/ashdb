@@ -143,10 +143,7 @@ impl Manifest {
     }
 
     pub fn sync(&self) -> Result<()> {
-        self.writer
-            .lock()
-?
-            .flush()?;
+        self.writer.lock()?.flush()?;
 
         let header = self.header.read()?;
         let header_bytes = header.encode();

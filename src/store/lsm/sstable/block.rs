@@ -103,7 +103,9 @@ impl Block {
 
         let restart_array_size = num_restarts * 4;
         if num_restarts_offset < restart_array_size {
-            return Err(Error::InvalidData("Data too short for restart positions".to_string()));
+            return Err(Error::InvalidData(
+                "Data too short for restart positions".to_string(),
+            ));
         }
 
         let restart_array_offset = num_restarts_offset - restart_array_size;
@@ -332,7 +334,12 @@ impl Iterator for BlockIterator {
             ($expr:expr, $field:expr) => {
                 match $expr {
                     Ok(val) => val,
-                    Err(e) => return Some(Err(Error::InvalidData(format!("Failed to decode {}: {}", $field, e)))),
+                    Err(e) => {
+                        return Some(Err(Error::InvalidData(format!(
+                            "Failed to decode {}: {}",
+                            $field, e
+                        ))))
+                    }
                 }
             };
         }
@@ -346,9 +353,7 @@ impl Iterator for BlockIterator {
         pos += 4;
 
         if shared_len > self.last_key.len() || pos + unshared_len + value_len > data.len() {
-            return Some(Err(Error::InvalidData(
-                "Block entry out of bounds".into(),
-            )));
+            return Some(Err(Error::InvalidData("Block entry out of bounds".into())));
         }
 
         let mut key = Vec::with_capacity(shared_len + unshared_len);

@@ -106,8 +106,7 @@ impl Scheduler {
 
         // Wait for all tasks to complete
         for task in tasks {
-            task.await
-?;
+            task.await?;
         }
 
         Ok(())

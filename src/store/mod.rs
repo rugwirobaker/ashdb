@@ -80,6 +80,7 @@
 
 pub mod lsm;
 
+use crate::encoding::keycode;
 use crate::error::Result;
 use std::ops::RangeBounds;
 
@@ -116,18 +117,7 @@ pub trait Store: Send + Sync {
     where
         Self: Sized, // omit in trait objects, for dyn compatibility
     {
-        let start = std::ops::Bound::Included(prefix.to_vec());
-        let end = match prefix.iter().rposition(|b| *b != 0xff) {
-            Some(i) => std::ops::Bound::Excluded(
-                prefix[..i]
-                    .iter()
-                    .chain(std::iter::once(&(prefix[i] + 1)))
-                    .copied()
-                    .collect::<Vec<u8>>(),
-            ),
-            None => std::ops::Bound::Unbounded,
-        };
-        self.scan((start, end))
+        self.scan(keycode::prefix_range(prefix))
     }
 
     /// Synchronizes buffered data to disk, ensuring durability.
