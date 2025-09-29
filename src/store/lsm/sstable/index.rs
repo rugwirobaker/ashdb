@@ -210,24 +210,15 @@ impl TryFrom<&[u8]> for Index {
 
         while (cursor.position() as usize) < buffer.len() {
             // Read key length (u16)
-            let key_len = cursor
-                .read_u16::<BigEndian>()
-?
-                as usize;
+            let key_len = cursor.read_u16::<BigEndian>()? as usize;
 
             // Read key bytes
             let mut key = vec![0u8; key_len];
-            cursor
-                .read_exact(&mut key)
-?;
+            cursor.read_exact(&mut key)?;
 
-            let block_offset = cursor
-                .read_u64::<BigEndian>()
-?;
+            let block_offset = cursor.read_u64::<BigEndian>()?;
 
-            let block_size = cursor
-                .read_u64::<BigEndian>()
-?;
+            let block_size = cursor.read_u64::<BigEndian>()?;
 
             entries.push((key, block_offset, block_size));
         }

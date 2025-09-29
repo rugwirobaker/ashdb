@@ -1,60 +1,71 @@
 pub mod bincode;
+pub mod format;
 pub mod keycode;
+
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use crate::error::Result;
 
-/// Trait for encoding keys with order preservation.
+/// Trait for encoding keys with order preservation using keycode.
 ///
 /// Keys must maintain lexicographic ordering after encoding to support
-/// efficient range scans. This is critical for the SCAN command in the CLI.
-pub trait Key {
+/// efficient range scans. This trait uses the keycode module for
+/// order-preserving serialization.
+pub trait Key: Serialize + DeserializeOwned {
     /// Encode the key to bytes while preserving sort order
-    fn encode(&self) -> Vec<u8>;
+    fn encode(&self) -> Vec<u8> {
+        keycode::serialize(self)
+    }
 
     /// Decode bytes back to the original key type
-    fn decode(bytes: &[u8]) -> Result<Self>
-    where
-        Self: Sized;
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        keycode::deserialize(bytes)
+    }
 }
 
-/// Trait for encoding values for storage.
+/// Trait for encoding values for storage using bincode.
 ///
 /// Values don't need to preserve ordering, so we can use more efficient
-/// serialization methods.
-pub trait Value {
+/// serialization methods like bincode.
+pub trait Value: Serialize + DeserializeOwned {
     /// Encode the value to bytes
-    fn encode(&self) -> Vec<u8>;
+    fn encode(&self) -> Vec<u8> {
+        bincode::serialize(self)
+    }
 
     /// Decode bytes back to the original value type
-    fn decode(bytes: &[u8]) -> Result<Self>
-    where
-        Self: Sized;
-}
-
-/// Error type for encoding operations
-#[derive(Debug)]
-pub enum EncodingError {
-    InvalidFormat(String),
-    UnsupportedType,
-    TruncatedData,
-    InvalidUtf8,
-}
-
-impl std::fmt::Display for EncodingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncodingError::InvalidFormat(msg) => write!(f, "Invalid encoding format: {}", msg),
-            EncodingError::UnsupportedType => write!(f, "Unsupported data type"),
-            EncodingError::TruncatedData => write!(f, "Truncated data"),
-            EncodingError::InvalidUtf8 => write!(f, "Invalid UTF-8 sequence"),
-        }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        bincode::deserialize(bytes)
     }
 }
 
-impl std::error::Error for EncodingError {}
+// Blanket implementations for common types that can be used as keys
+impl Key for bool {}
+impl Key for i64 {}
+impl Key for u64 {}
+impl Key for f64 {}
+impl Key for String {}
+impl Key for Vec<u8> {}
 
-impl From<EncodingError> for crate::Error {
-    fn from(err: EncodingError) -> Self {
-        crate::Error::InvalidInput(err.to_string())
-    }
+// Blanket implementations for common types that can be used as values
+impl<T> Value for T where T: Serialize + DeserializeOwned {}
+
+// Additional key implementations for tuples (commonly used in composite keys)
+impl<A: Serialize + DeserializeOwned> Key for (A,) {}
+impl<A: Serialize + DeserializeOwned, B: Serialize + DeserializeOwned> Key for (A, B) {}
+impl<
+        A: Serialize + DeserializeOwned,
+        B: Serialize + DeserializeOwned,
+        C: Serialize + DeserializeOwned,
+    > Key for (A, B, C)
+{
+}
+impl<
+        A: Serialize + DeserializeOwned,
+        B: Serialize + DeserializeOwned,
+        C: Serialize + DeserializeOwned,
+        D: Serialize + DeserializeOwned,
+    > Key for (A, B, C, D)
+{
 }
