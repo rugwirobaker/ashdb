@@ -1,4 +1,7 @@
-use super::manifest::{Level, SSTable};
+use super::{
+    manifest::{Level, SSTable},
+    sstable::table,
+};
 use crate::error::Result;
 
 /// Manually flush oldest frozen memtable to SSTable (for testing)
@@ -25,7 +28,7 @@ pub async fn flush_memtable(store: &super::LsmTree) -> Result<bool> {
 
     // Create SSTable (I/O - no locks held)
     let (table_id, table_path) = store.next_sstable_path();
-    let mut sstable = super::sstable::table::Table::writable(table_path.to_str().unwrap())?;
+    let mut sstable = table::Table::new(table_path.to_str().unwrap())?;
 
     // Extract metadata during flush
     let (min_key, max_key, entry_count) = {

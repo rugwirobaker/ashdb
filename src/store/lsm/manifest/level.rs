@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-use super::super::sstable::table::Table;
+use super::super::sstable::table::{Readable, Table};
 use super::meta::TableMeta;
 use crate::error::Result;
 
 pub struct SSTable {
     pub id: u64,
-    pub table: Table,
+    pub table: Table<Readable>,
     pub path: PathBuf,
     pub size: u64, // Size in bytes
     pub min_key: Vec<u8>,
@@ -19,7 +19,7 @@ impl SSTable {
     ///
     /// This is the single, canonical way to create an SSTable instance, ensuring that the in-memory
     /// representation is always consistent with the metadata stored in the manifest.
-    pub fn new(path: PathBuf, table: Table, table_meta: &TableMeta) -> Result<Self> {
+    pub fn new(path: PathBuf, table: Table<Readable>, table_meta: &TableMeta) -> Result<Self> {
         Ok(Self {
             id: table_meta.id,
             table,

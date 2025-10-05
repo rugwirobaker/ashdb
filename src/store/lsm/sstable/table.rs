@@ -31,7 +31,6 @@ use super::super::filter::RangeFilter;
 use super::block::{Block, MultiBlockIterator};
 use super::index::Index;
 use crate::error::Result;
-use crate::Error;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
@@ -44,138 +43,105 @@ use std::ops::RangeBounds;
 /// caused it to exceed this size.
 pub const MAX_BLOCK_SIZE: usize = 4096;
 
-/// Represents an SSTable, which can be in either a writable or readable state.
-/// This enum acts as a state machine to ensure that operations like `get` cannot
-/// be called on a table that is still being written.
-pub enum Table {
-    Writable(WritableTable),
-    Readable(ReadableTable),
-}
+/// Marker trait for table states in the typestate pattern.
+/// This enables compile-time enforcement of valid operations on tables.
+pub trait TableState {}
 
-/// A handle to an SSTable that is currently being written.
-pub struct WritableTable {
-    /// The file handle for the SSTable.
-    file: File,
-    /// The path to the SSTable file.
-    path: String,
+/// Represents a table that is currently being written.
+/// Contains state needed during the write phase.
+pub struct Writable {
     /// The sparse index, built in memory as blocks are added.
     index: Index,
     /// The current write offset in the file.
     offset: u64,
 }
 
-impl Table {
-    /// Creates a new `WritableTable` at the given path.
-    pub fn writable(path: &str) -> Result<Self> {
-        Ok(Self::Writable(WritableTable::new(path)?))
-    }
+impl TableState for Writable {}
 
-    /// Opens an existing SSTable file for reading.
-    pub fn readable(path: &str) -> Result<Self> {
-        Ok(Self::Readable(ReadableTable::open(path)?))
-    }
-
-    /// Adds a new data block to a `WritableTable`.
-    ///
-    /// The `first_key` is used to create an entry in the sparse index.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `InvalidOperation` error if the table is in a readable state.
-    pub fn add_block(&mut self, block_data: &[u8], first_key: Vec<u8>) -> Result<()> {
-        match self {
-            Table::Writable(writable) => writable.add_block(block_data, first_key),
-            Table::Readable(_) => Err(Error::ReadOnly),
-        }
-    }
-
-    /// Finalizes a `WritableTable`, making it readable.
-    ///
-    /// This method writes the index block and the footer to the file, then
-    /// transitions the table state from `Writable` to `Readable`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `InvalidOperation` error if the table is already in a readable state.
-    pub fn finalize(&mut self) -> Result<Table> {
-        match self {
-            Table::Writable(writable) => writable.finalize(),
-            Table::Readable(_) => Err(Error::ReadOnly),
-        }
-    }
-
-    /// Retrieves the value for a given key from a `ReadableTable`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `InvalidOperation` error if the table is in a writable state.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self {
-            Table::Readable(readable) => readable.get(key),
-            // TODO: This error doesn't make logical sense - writable table isn't read-only.
-            // Consider better error variant or change implementation to allow reading from writable tables.
-            Table::Writable(_) => Err(Error::ReadOnly),
-        }
-    }
-
-    /// Creates an iterator over a range of key-value pairs in a `ReadableTable`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `InvalidOperation` error if the table is in a writable state.
-    pub fn scan<R>(&self, range: R) -> Result<ScanIterator<R>>
-    where
-        R: RangeBounds<Vec<u8>> + Clone + Send + Sync,
-    {
-        match self {
-            Table::Readable(readable) => readable.scan(range),
-            // TODO: This error doesn't make logical sense - writable table isn't read-only.
-            // Consider better error variant or change implementation to allow reading from writable tables.
-            Table::Writable(_) => Err(Error::ReadOnly),
-        }
-    }
+/// Represents a table that has been finalized and is ready for reading.
+/// Contains the loaded index for efficient lookups.
+pub struct Readable {
+    /// The sparse index, loaded from disk.
+    index: Index,
 }
 
-impl WritableTable {
+impl TableState for Readable {}
+
+/// An SSTable parameterized by its state (Writable or Readable).
+/// This typestate pattern ensures operations are only available in the correct state.
+pub struct Table<S: TableState> {
+    /// The file handle for the SSTable.
+    file: File,
+    /// The path to the SSTable file.
+    path: String,
+    /// The state-specific data.
+    state: S,
+}
+
+// Methods available only on writable tables
+impl Table<Writable> {
+    /// Creates a new `Table` in writable state at the given path.
     pub fn new(path: &str) -> Result<Self> {
         let file = File::create(path)?;
         Ok(Self {
             file,
             path: path.to_string(),
-            index: Index::new(),
-            offset: 0,
+            state: Writable {
+                index: Index::new(),
+                offset: 0,
+            },
         })
     }
 
+    /// Adds a new data block to the table.
+    ///
+    /// The `first_key` is used to create an entry in the sparse index.
     pub fn add_block(&mut self, block_data: &[u8], first_key: Vec<u8>) -> Result<()> {
         let block_size = block_data.len() as u64;
         self.file.write_all(block_data)?;
-        self.index.push(first_key, self.offset, block_size);
-        self.offset += block_data.len() as u64;
+        self.state
+            .index
+            .push(first_key, self.state.offset, block_size);
+        self.state.offset += block_data.len() as u64;
         Ok(())
     }
 
-    pub fn finalize(&mut self) -> Result<Table> {
-        let index_data: Vec<u8> = self.index.clone().try_into()?;
-        let index_offset = self.offset;
+    /// Finalizes the table, transitioning it to readable state.
+    ///
+    /// This method writes the index block and footer to the file, consumes the
+    /// writable table, and returns a readable table.
+    pub fn finalize(mut self) -> Result<Table<Readable>> {
+        let index_data: Vec<u8> = self.state.index.clone().try_into()?;
+        let index_offset = self.state.offset;
 
         self.file.write_all(&index_data)?;
         self.file.write_u64::<BigEndian>(index_offset)?;
         self.file.flush()?;
-        // Create a new `ReadableTable` from the same file path
-        let readable = ReadableTable::open(&self.path)?;
-        // Return the table in readable mode
-        Ok(Table::Readable(readable))
+
+        // Re-open the file for reading and load the index
+        let mut file = File::open(&self.path)?;
+        let file_size = file.metadata()?.len();
+
+        file.seek(SeekFrom::End(-8))?;
+        let index_offset = file.read_u64::<BigEndian>()?;
+
+        let mut index_data = vec![0u8; (file_size - 8 - index_offset) as usize];
+        file.seek(SeekFrom::Start(index_offset))?;
+        file.read_exact(&mut index_data)?;
+
+        let index = Index::try_from(index_data.as_slice())?;
+
+        Ok(Table {
+            file,
+            path: self.path,
+            state: Readable { index },
+        })
     }
 }
 
-pub struct ReadableTable {
-    file: File,
-    index: Index,
-}
-
-impl ReadableTable {
-    /// Opens an SSTable file and loads its index into memory.
+// Methods available only on readable tables
+impl Table<Readable> {
+    /// Opens an existing SSTable file for reading.
     pub fn open(path: &str) -> Result<Self> {
         let mut file = File::open(path)?;
         let file_size = file.metadata()?.len();
@@ -189,7 +155,11 @@ impl ReadableTable {
 
         let index = Index::try_from(index_data.as_slice())?;
 
-        Ok(Self { file, index })
+        Ok(Self {
+            file,
+            path: path.to_string(),
+            state: Readable { index },
+        })
     }
 
     /// Retrieves the value for a given key.
@@ -197,7 +167,7 @@ impl ReadableTable {
     /// This method first uses the sparse index to find the data block that may
     /// contain the key, then reads that block from disk and searches within it.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if let Some(entry) = self.index.find(key) {
+        if let Some(entry) = self.state.index.find(key) {
             let (block_offset, block_size) = (entry.offset, entry.size);
 
             let mut block_data = vec![0u8; block_size as usize];
@@ -216,7 +186,7 @@ impl ReadableTable {
     where
         R: RangeBounds<Vec<u8>> + Clone + Send + Sync,
     {
-        let blocks = self.index.range(range.clone());
+        let blocks = self.state.index.range(range.clone());
         let reader = self.file.try_clone()?;
 
         let mut multi_block_iter = MultiBlockIterator::new(reader, blocks)?;
@@ -271,7 +241,7 @@ mod tests {
         let path = temp_file.path().to_str().unwrap();
 
         // Create a writable table
-        let mut table = Table::writable(path).expect("Failed to create writable table");
+        let mut table = Table::new(path).expect("Failed to create writable table");
 
         // Build blocks and add them to the table
         let mut builder = Builder::new();
@@ -307,16 +277,12 @@ mod tests {
         let table = table.finalize().expect("Failed to finalize table");
 
         // Read entries from the table
-        if let Table::Readable(readable) = table {
-            for (key, value) in entries {
-                let result = readable
-                    .get(&key)
-                    .expect("Error during read")
-                    .expect("Key not found");
-                assert_eq!(result, value, "Value mismatch for key {:?}", key);
-            }
-        } else {
-            panic!("Expected readable table after finalize");
+        for (key, value) in entries {
+            let result = table
+                .get(&key)
+                .expect("Error during read")
+                .expect("Key not found");
+            assert_eq!(result, value, "Value mismatch for key {:?}", key);
         }
     }
 
@@ -331,7 +297,7 @@ mod tests {
         let path = temp_file.path();
 
         // Write sample SSTable data
-        let mut table = Table::writable(path.to_str().unwrap()).expect("Failed to create table");
+        let mut table = Table::new(path.to_str().unwrap()).expect("Failed to create table");
 
         // Generate a larger number of entries to ensure multiple blocks are created
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..100)
@@ -377,10 +343,7 @@ mod tests {
                 .expect("Failed to add block");
         }
 
-        let table = match table.finalize().expect("Failed to finalize table") {
-            Table::Readable(readable) => readable,
-            _ => panic!("Table did not transition to readable mode"),
-        };
+        let table = table.finalize().expect("Failed to finalize table");
 
         // Define the exact range to scan
         let scan_range = b"key_010".to_vec()..=b"key_020".to_vec();
@@ -419,7 +382,7 @@ mod tests {
         ];
 
         // Create a writable table
-        let mut table = Table::writable(path).expect("Failed to create writable table");
+        let mut table = Table::new(path).expect("Failed to create writable table");
 
         // Build blocks and add them to the table
         let mut builder = Builder::new();
@@ -443,13 +406,9 @@ mod tests {
         let table = table.finalize().expect("Failed to finalize table");
 
         // Test reading a non-existent key
-        if let Table::Readable(readable) = table {
-            let non_existent_key = b"nonexistent".to_vec();
-            let result = readable.get(&non_existent_key).expect("Error during read");
-            assert!(result.is_none(), "Non-existent key unexpectedly found");
-        } else {
-            panic!("Expected readable table after finalize");
-        }
+        let non_existent_key = b"nonexistent".to_vec();
+        let result = table.get(&non_existent_key).expect("Error during read");
+        assert!(result.is_none(), "Non-existent key unexpectedly found");
     }
 
     #[tokio::test]
@@ -459,7 +418,7 @@ mod tests {
         let path = temp_file.path();
 
         // Create an SSTable with a large number of entries to ensure multiple blocks
-        let mut table = Table::writable(path.to_str().unwrap()).expect("Failed to create table");
+        let mut table = Table::new(path.to_str().unwrap()).expect("Failed to create table");
 
         // Generate 1000 entries to ensure we have multiple blocks and good test coverage
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..1000)
@@ -505,10 +464,7 @@ mod tests {
         }
 
         // Finalize the table
-        let table = match table.finalize().expect("Failed to finalize table") {
-            Table::Readable(readable) => Arc::new(readable),
-            _ => panic!("Table did not transition to readable mode"),
-        };
+        let table = Arc::new(table.finalize().expect("Failed to finalize table"));
 
         // Test configuration - with tokio we can handle many more concurrent tasks
         const NUM_TASKS: usize = 20;
@@ -597,7 +553,7 @@ mod tests {
         let path = temp_file.path();
 
         // Create an SSTable with entries
-        let mut table = Table::writable(path.to_str().unwrap()).expect("Failed to create table");
+        let mut table = Table::new(path.to_str().unwrap()).expect("Failed to create table");
 
         // Generate 500 entries for overlapping range tests
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..500)
@@ -640,10 +596,7 @@ mod tests {
                 .expect("Failed to add block");
         }
 
-        let table = match table.finalize().expect("Failed to finalize table") {
-            Table::Readable(readable) => Arc::new(readable),
-            _ => panic!("Table did not transition to readable mode"),
-        };
+        let table = Arc::new(table.finalize().expect("Failed to finalize table"));
 
         // Test concurrent scans with heavily overlapping ranges
         // Each task scans 200 consecutive entries with significant overlap
@@ -675,7 +628,7 @@ mod tests {
                     let end_key_bytes = format!("key_{:04}", end_idx - 1).into_bytes();
 
                     assert!(
-                        key >= start_key_bytes && key <= end_key_bytes,
+                        key.as_slice() >= start_key_bytes.as_slice() && key.as_slice() <= end_key_bytes.as_slice(),
                         "Task {} key {:?} outside range [{:04}, {:04}]",
                         task_id,
                         String::from_utf8_lossy(&key),
@@ -737,7 +690,7 @@ mod tests {
         let path = temp_file.path();
 
         // Create an SSTable with entries
-        let mut table = Table::writable(path.to_str().unwrap()).expect("Failed to create table");
+        let mut table = Table::new(path.to_str().unwrap()).expect("Failed to create table");
 
         // Generate 800 entries for mixed workload tests
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..800)
@@ -780,10 +733,7 @@ mod tests {
                 .expect("Failed to add block");
         }
 
-        let table = match table.finalize().expect("Failed to finalize table") {
-            Table::Readable(readable) => Arc::new(readable),
-            _ => panic!("Table did not transition to readable mode"),
-        };
+        let table = Arc::new(table.finalize().expect("Failed to finalize table"));
 
         // Mixed workload: some tasks do gets, others do scans
         const NUM_GET_TASKS: usize = 8;
@@ -939,7 +889,7 @@ mod tests {
         let path = temp_file.path();
 
         // Create an SSTable with enough entries to create multiple blocks
-        let mut table = Table::writable(path.to_str().unwrap()).expect("Failed to create table");
+        let mut table = Table::new(path.to_str().unwrap()).expect("Failed to create table");
 
         // Generate 1200 entries to ensure we have multiple blocks
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..1200)
@@ -983,10 +933,7 @@ mod tests {
                 .expect("Failed to add block");
         }
 
-        let table = match table.finalize().expect("Failed to finalize table") {
-            Table::Readable(readable) => Arc::new(readable),
-            _ => panic!("Table did not transition to readable mode"),
-        };
+        let table = Arc::new(table.finalize().expect("Failed to finalize table"));
 
         // High concurrency stress test specifically targeting file handle cloning
         // This test uses many concurrent tasks to stress File::try_clone()
@@ -1017,11 +964,9 @@ mod tests {
                                         format!("value_{:05}_{}", key_idx, "x".repeat(50))
                                             .into_bytes();
                                     assert_eq!(
-                                        value,
-                                        expected_value,
+                                        value, expected_value,
                                         "Task {} get operation got wrong value for key {}",
-                                        task_id,
-                                        key_idx
+                                        task_id, key_idx
                                     );
                                     successful_operations += 1;
                                 }

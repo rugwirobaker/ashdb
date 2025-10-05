@@ -42,6 +42,7 @@
 
 use super::{
     manifest::{Level, SSTable},
+    sstable::table,
     LsmState,
 };
 use crate::{config::CompactionConfig, error::Result};
@@ -159,7 +160,7 @@ pub async fn compact(store: &super::LsmTree) -> Result<()> {
     let merge = CompactionIterator::new(iterators);
 
     let (table_id, table_path) = store.next_sstable_path();
-    let mut writable_table = super::sstable::table::Table::writable(table_path.to_str().unwrap())?;
+    let mut writable_table = table::Table::new(table_path.to_str().unwrap())?;
 
     let mut builder = super::sstable::block::Builder::new();
     let mut first_key_in_block: Option<Vec<u8>> = None;

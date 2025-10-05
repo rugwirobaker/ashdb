@@ -74,7 +74,7 @@ fn levels_from_manifest_state(dir: &Path, state: &ManifestState) -> Result<Vec<L
 
         for table_meta in &level_meta.tables {
             let path = dir.join("sst").join(format!("{:08}.sst", table_meta.id));
-            let table = Table::readable(path.to_str().unwrap())?;
+            let table = Table::open(path.to_str().unwrap())?;
             levels[level_meta.level as usize].add_sstable(SSTable {
                 id: table_meta.id,
                 table,
