@@ -86,7 +86,7 @@ impl LsmState {
     }
 
     /// Increment compaction counter
-    pub fn start_compaction(&self) -> CompactionGuard {
+    pub fn start_compaction(&self) -> CompactionGuard<'_> {
         self.compaction_running.fetch_add(1, Ordering::SeqCst);
         CompactionGuard { state: self }
     }
@@ -98,7 +98,7 @@ impl LsmState {
     }
 
     /// Try to start freeze operation (returns guard if successful)
-    pub fn try_start_freeze(&self) -> Option<FreezeGuard> {
+    pub fn try_start_freeze(&self) -> Option<FreezeGuard<'_>> {
         if !self.freeze_in_progress.swap(true, Ordering::SeqCst) {
             Some(FreezeGuard { state: self })
         } else {

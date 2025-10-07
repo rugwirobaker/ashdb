@@ -16,7 +16,7 @@
 //! +-------------------+
 //! | Data Block 1      |  ← Variable size, ~4KB target
 //! +-------------------+
-//! | Data Block 2      |  ← Contains prefix-compressed entries
+//! | Data Block 2      |  ← Uncompressed key-value entries
 //! +-------------------+
 //! | ...               |
 //! +-------------------+
@@ -33,16 +33,21 @@
 //! ## Data Blocks (`block.rs`)
 //!
 //! Data blocks are the fundamental storage units, typically ~4KB in size:
-//! - **Prefix compression**: Keys share common prefixes to reduce storage
-//! - **Restart points**: Every 16 entries, full keys are stored for efficient seeking
-//! - **Binary search**: Restart points enable O(log n) seeks within blocks
+//! - **Uncompressed keys**: Full keys stored for simplicity and reverse iteration
+//! - **Linear scan**: Entries are scanned sequentially for forward iteration
+//! - **Lazy offset tracking**: Reverse iteration builds offset index on-demand
+//! - **Double-ended**: Supports both `Iterator` and `DoubleEndedIterator`
 //!
 //! ### Block Entry Format
 //! ```text
-//! +----------------+----------------+-------------+--------+-------+
-//! |shared_len:u16  |unshared_len:u16|value_len:u32| key   | value |
-//! +----------------+----------------+-------------+--------+-------+
+//! +-----------+-------+-------------+-----+-------+
+//! |key_len:u16|op:u8  |value_len:u32| key | value |
+//! +-----------+-------+-------------+-----+-------+
 //! ```
+//!
+//! Where `op` is one of:
+//! - `0x00`: Put (key-value pair)
+//! - `0x01`: Delete (tombstone marker)
 //!
 //! ## Sparse Index (`index.rs`)
 //!
@@ -61,16 +66,30 @@
 //! ## Table Management (`table.rs`)
 //!
 //! Handles SSTable lifecycle from creation to querying:
-//! - **State machine**: Enforces write-then-read lifecycle
+//! - **Typestate pattern**: Enforces write-then-read lifecycle at compile time
 //! - **Concurrent access**: Multiple readers via file handle cloning
 //! - **Range filtering**: Combines index lookups with iterator chaining
 //!
 //! # Performance Characteristics
 //!
-//! - **Point lookups**: O(log blocks + log entries_per_block)
+//! - **Point lookups**: O(log blocks + entries_per_block)
 //! - **Range scans**: O(log blocks + scan_size)
-//! - **Storage efficiency**: 15-30% space savings from prefix compression
+//! - **Forward iteration**: Zero overhead, no memory allocation
+//! - **Reverse iteration**: Lazy offset index built on first `next_back()` call
 //! - **Cache friendly**: 4KB blocks align with OS page size
+//!
+//! # Iteration Model
+//!
+//! All iterators support both forward and reverse iteration through Rust's
+//! `DoubleEndedIterator` trait:
+//!
+//! - **`BlockIterator`**: Lazily tracks entry offsets for reverse traversal
+//! - **`MultiBlockIterator`**: Chains blocks in both directions
+//! - **`RangeFilter`**: Wraps iterators with range bounds checking
+//!
+//! Reverse iteration is optimized for minimal overhead when unused:
+//! - Forward-only iteration: O(1) space
+//! - Reverse iteration: O(n) space only for visited entries
 //!
 //! # Future Optimizations
 //!

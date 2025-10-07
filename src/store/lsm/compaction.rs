@@ -42,11 +42,12 @@
 
 use super::{
     manifest::{Level, SSTable},
+    sstable::table,
     LsmState,
 };
 use crate::{config::CompactionConfig, error::Result};
 
-use super::iterator::{LSMIterator, LSMScanIterator};
+use super::iterator::{CompactionIterator, InternalIterator};
 
 /// Check if compaction is needed
 pub fn needs_compaction(state: &LsmState, config: &CompactionConfig) -> bool {
@@ -149,17 +150,17 @@ pub async fn compact(store: &super::LsmTree) -> Result<()> {
                 .find(|s| s.id == table_meta.id)
                 .ok_or_else(|| crate::Error::InvalidData("SSTable not found".to_string()))?;
 
-            let scan_iter = sstable.table.scan(..)?;
-            let boxed_iter: LSMIterator = Box::new(scan_iter);
+            let scan = sstable.table.scan(..)?;
+            let boxed_iter: InternalIterator = Box::new(scan);
             iterators.push(boxed_iter);
         }
     }
 
-    // 2. Create merge iterator and write to new SSTable
-    let merge_iter = LSMScanIterator::new(iterators);
+    // 2. Create merge iterator and write to new SSTable (preserve tombstones for compaction)
+    let merge = CompactionIterator::new(iterators);
 
     let (table_id, table_path) = store.next_sstable_path();
-    let mut writable_table = super::sstable::table::Table::writable(table_path.to_str().unwrap())?;
+    let mut writable_table = table::Table::new(table_path.to_str().unwrap())?;
 
     let mut builder = super::sstable::block::Builder::new();
     let mut first_key_in_block: Option<Vec<u8>> = None;
@@ -167,7 +168,7 @@ pub async fn compact(store: &super::LsmTree) -> Result<()> {
     let mut min_key: Option<Vec<u8>> = None;
     let mut max_key: Option<Vec<u8>> = None;
 
-    for entry_result in merge_iter {
+    for entry_result in merge {
         let (key, value) = entry_result?;
 
         // Track min/max keys
@@ -180,7 +181,7 @@ pub async fn compact(store: &super::LsmTree) -> Result<()> {
             first_key_in_block = Some(key.clone());
         }
 
-        builder.add_entry(&key, &value);
+        builder.add_entry(&key, value.as_deref());
         entry_count += 1;
 
         // Flush block when it gets large enough

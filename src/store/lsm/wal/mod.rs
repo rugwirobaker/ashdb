@@ -25,16 +25,17 @@
 //! Each entry is variable-length and contains:
 //!
 //! ```text
-//! +-----------+-------+-----------+-------+-----------+
-//! |key_len:u32| key   |val_len:u32| value |crc32:u32  |
-//! +-----------+-------+-----------+-------+-----------+
-//! |  4 bytes  |var len|  4 bytes  |var len| 4 bytes   |
-//! +-----------+-------+-----------+-------+-----------+
+//! +--------+-----------+-------+-----------+-------+-----------+
+//! |type:u8 |key_len:u32| key   |val_len:u32| value |crc32:u32  |
+//! +--------+-----------+-------+-----------+-------+-----------+
+//! | 1 byte |  4 bytes  |var len|  4 bytes  |var len| 4 bytes   |
+//! +--------+-----------+-------+-----------+-------+-----------+
 //! ```
 //!
 //! - All multi-byte integers use big-endian encoding for portability
 //! - CRC32 checksum covers the entire entry (excluding the checksum itself)
-//! - Delete operations use `val_len = 0` with no value data
+//! - Type byte: 0x00 = Put operation, 0x01 = Delete operation (tombstone)
+//! - Delete operations have `val_len = 0` with no value data
 //!
 //! # IO Optimizations for Durability
 //!
@@ -85,6 +86,30 @@ type WalEntry = (Vec<u8>, Option<Vec<u8>>);
 
 pub const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Operation type for WAL entries
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpType {
+    Put = 0x00,
+    Delete = 0x01,
+}
+
+impl OpType {
+    fn from_byte(byte: u8) -> Result<Self> {
+        match byte {
+            0x00 => Ok(OpType::Put),
+            0x01 => Ok(OpType::Delete),
+            _ => Err(Error::InvalidData(format!(
+                "Unknown operation type: {}",
+                byte
+            ))),
+        }
+    }
+
+    fn to_byte(self) -> u8 {
+        self as u8
+    }
+}
 
 pub struct WalOptions {
     pub use_direct_io: bool,
@@ -208,6 +233,12 @@ impl Wal {
 impl Wal {
     pub fn append(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         let mut payload = Vec::new();
+        let op_type = if value.is_some() {
+            OpType::Put
+        } else {
+            OpType::Delete
+        };
+        payload.write_u8(op_type.to_byte())?;
         payload.write_u32::<BigEndian>(key.len() as u32)?;
         payload.write_u32::<BigEndian>(value.map_or(0, |v| v.len()) as u32)?;
         payload.extend_from_slice(key);
@@ -295,6 +326,12 @@ impl ReplayIterator {
         }
 
         let mut cursor = Cursor::new(&payload);
+
+        let op_type_byte = match cursor.read_u8() {
+            Ok(byte) => byte,
+            Err(e) => return Err(e.into()),
+        };
+        let _op_type = OpType::from_byte(op_type_byte)?;
 
         let key_len = match cursor.read_u32::<BigEndian>() {
             Ok(len) => len as usize,

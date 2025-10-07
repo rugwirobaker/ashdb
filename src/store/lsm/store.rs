@@ -1,6 +1,9 @@
 use super::{
-    super::Store, compaction, flush, iterator::LSMScanIterator, memtable::ActiveMemtable, recovery,
-    LsmState,
+    super::Store,
+    compaction, flush,
+    iterator::LsmIterator,
+    memtable::{self},
+    recovery, LsmState,
 };
 use crate::{config::LsmConfig, error::Result, flock::FileLock};
 
@@ -58,7 +61,7 @@ impl Drop for LsmTree {
 }
 
 impl Store for LsmTree {
-    type ScanIterator<'a> = LSMScanIterator<'a>;
+    type ScanIterator<'a> = LsmIterator<'a>;
 
     fn set(&self, key: &[u8], value: Vec<u8>) -> Result<()> {
         loop {
@@ -112,16 +115,17 @@ impl Store for LsmTree {
         &'a self,
         range: impl RangeBounds<Vec<u8>> + Clone + Send + Sync + 'a,
     ) -> Self::ScanIterator<'a> {
-        type BoxedResultIterator<'a> =
-            Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + Send + Sync + 'a>;
+        type BoxedInternalIterator<'a> = Box<
+            dyn DoubleEndedIterator<Item = Result<(Vec<u8>, Option<Vec<u8>>)>> + Send + Sync + 'a,
+        >;
 
         // Clone Arc to extend lifetime beyond lock
-        let active_arc = {
+        let active = {
             let active = self.state.active_memtable.read().unwrap();
             Arc::clone(active.memtable())
         };
 
-        let frozen_arcs: Vec<Arc<super::memtable::Memtable>> = {
+        let frozens: Vec<Arc<memtable::Memtable>> = {
             let frozen = self.state.frozen_memtables.read().unwrap();
             frozen
                 .iter()
@@ -131,17 +135,17 @@ impl Store for LsmTree {
         };
 
         // Create iterators for memtables using new scan pattern
-        let active_iter = match active_arc.scan(range.clone()) {
+        let active_iter = match active.scan(range.clone()) {
             Ok(iter) => iter,
-            Err(_) => return LSMScanIterator::new(vec![]), // Return empty iterator on error
+            Err(_) => return LsmIterator::new(vec![]), // Return empty iterator on error
         };
 
-        let frozen_iters: Vec<_> = frozen_arcs
+        let frozen_iters: Vec<_> = frozens
             .into_iter()
             .filter_map(|arc| arc.scan(range.clone()).ok())
             .collect();
 
-        let mut iterators: Vec<BoxedResultIterator> = vec![Box::new(active_iter)];
+        let mut iterators: Vec<BoxedInternalIterator> = vec![Box::new(active_iter)];
         for iter in frozen_iters {
             iterators.push(Box::new(iter));
         }
@@ -152,14 +156,37 @@ impl Store for LsmTree {
             for level in levels.iter() {
                 for sstable in &level.sstables {
                     if let Ok(scan_iter) = sstable.table.scan(range.clone()) {
-                        let boxed_iter: BoxedResultIterator = Box::new(scan_iter);
+                        let boxed_iter: BoxedInternalIterator = Box::new(scan_iter);
                         iterators.push(boxed_iter);
                     }
                 }
             }
         }
 
-        LSMScanIterator::new(iterators)
+        LsmIterator::new(iterators)
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        loop {
+            let active = self.state.active_memtable.read().unwrap();
+
+            match active.delete(key.to_vec()) {
+                Ok(_) => {
+                    // Check if freeze needed
+                    if active.size() >= self.config.max_memtable_size {
+                        drop(active); // Release read lock
+                        self.freeze_active_memtable()?;
+                    }
+                    return Ok(());
+                }
+                Err(crate::Error::ReadOnly) => {
+                    // Retry with new active memtable
+                    drop(active);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn sync(&self) -> Result<()> {
@@ -179,7 +206,10 @@ impl LsmTree {
 
         // Create new active memtable
         let (new_wal_id, wal_path) = self.next_wal_path();
-        let new_active = Arc::new(ActiveMemtable::new(wal_path.to_str().unwrap(), new_wal_id)?);
+        let new_active = Arc::new(memtable::ActiveMemtable::new(
+            wal_path.to_str().unwrap(),
+            new_wal_id,
+        )?);
 
         // Atomic swap
         let old_active = {
@@ -338,6 +368,32 @@ mod tests {
         assert_eq!(results[2].0, b"key3");
         assert_eq!(results[2].1, b"value3");
 
+        // Test delete operations
+        store.delete(b"key2")?;
+
+        // Verify deleted key returns None
+        assert_eq!(store.get(b"key2")?, None);
+
+        // Verify other keys still exist
+        assert_eq!(store.get(b"key1")?, Some(b"updated_value1".to_vec()));
+        assert_eq!(store.get(b"key3")?, Some(b"value3".to_vec()));
+
+        // Test scan after delete (should not include deleted key)
+        let scan_after_delete: Result<Vec<_>> = store.scan(..).collect();
+        let results_after_delete = scan_after_delete?;
+        assert_eq!(results_after_delete.len(), 2);
+        assert_eq!(results_after_delete[0].0, b"key1");
+        assert_eq!(results_after_delete[1].0, b"key3");
+
+        // Test delete non-existent key (should not error)
+        store.delete(b"nonexistent")?;
+
+        // Test delete then re-insert same key
+        store.delete(b"key1")?;
+        assert_eq!(store.get(b"key1")?, None);
+        store.set(b"key1", b"new_value1".to_vec())?;
+        assert_eq!(store.get(b"key1")?, Some(b"new_value1".to_vec()));
+
         // Test sync
         store.sync()?;
 
@@ -345,53 +401,238 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_api_contracts() -> Result<()> {
+    async fn test_lsm_api_contracts() -> Result<()> {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let store = create_test_store(&temp_dir);
 
-        // Test initial state
+        // === ACT 1: THE BEGINNING (Fresh Store) ===
         assert!(!store.needs_flush(), "Fresh store should not need flush");
         assert!(
             !store.needs_compaction(),
             "Fresh store should not need compaction"
         );
 
-        // Test flush when nothing to flush
+        // Test empty operations succeed gracefully
         let flushed = store.flush_memtable().await?;
         assert!(!flushed, "Should return false when nothing to flush");
-
-        // Test compaction when not needed (should succeed gracefully)
         store.compact().await?; // Should not error
 
-        // Test after adding minimal data
-        store.set(b"test_key", b"test_value".to_vec())?;
+        // === ACT 2: DATA CREATION & BASIC OPERATIONS ===
+        // The story begins: Alice and Bob join the system
+        store.set(b"user:alice", b"active".to_vec())?;
+        store.set(b"user:bob", b"inactive".to_vec())?;
 
-        // Should still not need flush (not frozen yet)
+        // Verify initial state
+        assert_eq!(
+            store.get(b"user:alice")?,
+            Some(b"active".to_vec()),
+            "Alice should be active initially"
+        );
+        assert_eq!(
+            store.get(b"user:bob")?,
+            Some(b"inactive".to_vec()),
+            "Bob should be inactive initially"
+        );
+
+        // Plot twist: Bob becomes active, Alice leaves the system
+        store.set(b"user:bob", b"active".to_vec())?; // Update
+        store.delete(b"user:alice")?; // Delete (creates tombstone)
+
+        // Verify immediate changes
+        assert_eq!(
+            store.get(b"user:alice")?,
+            None,
+            "Alice should be deleted immediately"
+        );
+        assert_eq!(
+            store.get(b"user:bob")?,
+            Some(b"active".to_vec()),
+            "Bob should be active after update"
+        );
+
+        // Should still not need flush (data in active memtable)
         assert!(
             !store.needs_flush(),
             "Should not need flush with just active memtable"
         );
 
-        // Freeze to create need for flush
+        // === ACT 3: THE FLUSH JOURNEY ===
+        // Force memtable freeze to create flush need
         store.freeze_active_memtable()?;
         assert!(store.needs_flush(), "Should need flush after freezing");
 
-        // Test multiple flush calls
+        // The great flush: memtable data moves to SSTables
         let first_flush = store.flush_memtable().await?;
         assert!(first_flush, "First flush should succeed");
 
+        // Verify data survives the flush journey
+        assert_eq!(
+            store.get(b"user:alice")?,
+            None,
+            "Alice should still be deleted after flush (tombstone in SSTable)"
+        );
+        assert_eq!(
+            store.get(b"user:bob")?,
+            Some(b"active".to_vec()),
+            "Bob should still be active after flush"
+        );
+
+        // API contracts after flush
+        assert!(!store.needs_flush(), "Should not need flush after flushing");
         let second_flush = store.flush_memtable().await?;
         assert!(
             !second_flush,
             "Second flush should return false (nothing to flush)"
         );
 
-        // Verify data integrity maintained
-        let value = store.get(b"test_key")?;
+        // === ACT 4: THE COMPACTION SAGA ===
+        // Add more data to trigger compaction need
+        for i in 0..50 {
+            let key = format!("batch_key_{:03}", i);
+            let value = format!("batch_value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+
+        // Create another frozen memtable to build up L0 tables
+        store.freeze_active_memtable()?;
+        store.flush_memtable().await?;
+
+        // Add one more batch and flush to exceed L0 compaction threshold
+        for i in 50..100 {
+            let key = format!("batch_key_{:03}", i);
+            let value = format!("batch_value_{}", i);
+            store.set(key.as_bytes(), value.as_bytes().to_vec())?;
+        }
+        store.freeze_active_memtable()?;
+        store.flush_memtable().await?;
+
+        // Now should need compaction
+        assert!(
+            store.needs_compaction(),
+            "Should need compaction after creating multiple L0 tables"
+        );
+
+        // The great compaction: SSTables merge across levels
+        store.compact().await?;
+
+        // Verify our heroes survive the compaction
         assert_eq!(
-            value,
-            Some(b"test_value".to_vec()),
-            "Data should be preserved through API operations"
+            store.get(b"user:alice")?,
+            None,
+            "Alice should still be deleted after compaction (tombstone survives)"
+        );
+        assert_eq!(
+            store.get(b"user:bob")?,
+            Some(b"active".to_vec()),
+            "Bob should still be active after compaction"
+        );
+
+        // Verify batch data survives compaction
+        for i in 0..100 {
+            let key = format!("batch_key_{:03}", i);
+            let expected_value = format!("batch_value_{}", i);
+            assert_eq!(
+                store.get(key.as_bytes())?,
+                Some(expected_value.as_bytes().to_vec()),
+                "Batch key {} should survive compaction",
+                i
+            );
+        }
+
+        // === ACT 5: RECOVERY & PERSISTENCE ===
+        // The ultimate test: store restart (simulates crash recovery)
+        let store_path = temp_dir.path().to_str().unwrap();
+        drop(store); // Close the store
+
+        // Reopen the store (recovery scenario)
+        let recovered_store = LsmTree::open(store_path)?;
+
+        // Verify our complete story persists after recovery
+        assert_eq!(
+            recovered_store.get(b"user:alice")?,
+            None,
+            "Alice should still be deleted after recovery (durability of tombstones)"
+        );
+        assert_eq!(
+            recovered_store.get(b"user:bob")?,
+            Some(b"active".to_vec()),
+            "Bob should still be active after recovery (durability of updates)"
+        );
+
+        // Verify batch data survives recovery
+        for i in 0..100 {
+            let key = format!("batch_key_{:03}", i);
+            let expected_value = format!("batch_value_{}", i);
+            assert_eq!(
+                recovered_store.get(key.as_bytes())?,
+                Some(expected_value.as_bytes().to_vec()),
+                "Batch key {} should survive recovery",
+                i
+            );
+        }
+
+        // === ACT 6: COMPLEX MIXED OPERATIONS ===
+        // Final test: complex mixed operations survive multiple cycles
+
+        // Add more characters to our story
+        recovered_store.set(b"user:charlie", b"pending".to_vec())?;
+        recovered_store.set(b"user:diana", b"active".to_vec())?;
+
+        // Update existing characters
+        recovered_store.set(b"user:bob", b"admin".to_vec())?; // Bob gets promoted
+
+        // Remove one character
+        recovered_store.delete(b"user:diana")?; // Diana leaves
+
+        // Force another complete cycle
+        recovered_store.freeze_active_memtable()?;
+        recovered_store.flush_memtable().await?;
+
+        if recovered_store.needs_compaction() {
+            recovered_store.compact().await?;
+        }
+
+        // Verify final state of our story
+        assert_eq!(
+            recovered_store.get(b"user:alice")?,
+            None,
+            "Alice should remain deleted through all operations"
+        );
+        assert_eq!(
+            recovered_store.get(b"user:bob")?,
+            Some(b"admin".to_vec()),
+            "Bob should have final promoted status"
+        );
+        assert_eq!(
+            recovered_store.get(b"user:charlie")?,
+            Some(b"pending".to_vec()),
+            "Charlie should exist with pending status"
+        );
+        assert_eq!(
+            recovered_store.get(b"user:diana")?,
+            None,
+            "Diana should be deleted in final state"
+        );
+
+        // Verify scan operations work correctly after all operations
+        let scan_results: Result<Vec<_>> = recovered_store
+            .scan(b"user:".to_vec()..b"user;".to_vec())
+            .collect();
+        let results = scan_results?;
+
+        // Should have Bob and Charlie, but not Alice or Diana
+        assert_eq!(
+            results.len(),
+            2,
+            "Should have exactly 2 users in final state"
+        );
+        assert!(
+            results.iter().any(|(k, _)| k == b"user:bob"),
+            "Bob should be present in scan results"
+        );
+        assert!(
+            results.iter().any(|(k, _)| k == b"user:charlie"),
+            "Charlie should be present in scan results"
         );
 
         Ok(())

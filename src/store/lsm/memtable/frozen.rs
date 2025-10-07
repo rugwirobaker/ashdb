@@ -25,7 +25,7 @@ impl FrozenMemtable {
         self.memtable.get(key)
     }
 
-    pub fn flush(&self, table: &mut table::Table) -> Result<()> {
+    pub fn flush(&self, table: &mut table::Table<table::Writable>) -> Result<()> {
         self.memtable.flush(table)
     }
 
