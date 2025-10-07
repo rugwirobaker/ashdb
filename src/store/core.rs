@@ -87,7 +87,7 @@ use std::ops::RangeBounds;
 /// operations (scan) on lexicographically ordered keys.
 pub trait Store: Send + Sync {
     /// The iterator returned by scan().
-    type ScanIterator<'a>: ScanIterator + 'a
+    type ScanIterator<'a>: ScanIterator + Send + Sync + 'a
     where
         Self: Sized + 'a; // omit in trait objects, for dyn compatibility
 
@@ -139,6 +139,7 @@ pub trait Store: Send + Sync {
 /// This trait is implemented by all iterators that yield key-value pairs
 /// from storage scans. The iterator maintains lexicographical key ordering
 /// and handles merging data from multiple sources.
-pub trait ScanIterator: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}
+pub trait ScanIterator: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + DoubleEndedIterator {}
 
-impl<I> ScanIterator for I where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}
+impl<I> ScanIterator for I where I: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + DoubleEndedIterator
+{}

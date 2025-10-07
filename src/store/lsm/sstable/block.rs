@@ -1,10 +1,8 @@
 use std::io::{Read, Seek, SeekFrom};
-use std::{cmp::Ordering, sync::Arc};
+use std::sync::Arc;
 
 use crate::{error::Result, Error};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-
-const RESTART_INTERVAL: usize = 16;
 
 /// Operation type for SSTable entries
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,12 +28,9 @@ impl OpType {
     }
 }
 
-// --- Builder (No changes needed) ---
 pub struct Builder {
     buffer: Vec<u8>,
-    restart_positions: Vec<u32>,
     entry_count: usize,
-    last_key: Vec<u8>,
 }
 
 impl Builder {
@@ -43,21 +38,14 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             buffer: Vec::new(),
-            restart_positions: Vec::new(),
             entry_count: 0,
-            last_key: Vec::new(),
         }
     }
 
+    /// Add an entry to the block.
+    /// Format: [key_len:u16][op:u8][value_len:u32][key][value]
     pub fn add_entry(&mut self, key: &[u8], value: Option<&[u8]>) {
-        let shared_prefix_len = if self.entry_count % RESTART_INTERVAL == 0 {
-            self.restart_positions.push(self.buffer.len() as u32);
-            0
-        } else {
-            self.shared_prefix_length(&self.last_key, key)
-        };
-
-        let unshared_key_len = key.len() - shared_prefix_len;
+        let key_len = key.len();
         let op_type = if value.is_some() {
             OpType::Put
         } else {
@@ -65,34 +53,20 @@ impl Builder {
         };
         let value_len = value.map_or(0, |v| v.len());
 
-        let mut entry_buf = Vec::with_capacity(9 + unshared_key_len + value_len);
-        entry_buf
-            .write_u16::<BigEndian>(shared_prefix_len as u16)
-            .unwrap();
-        entry_buf
-            .write_u16::<BigEndian>(unshared_key_len as u16)
-            .unwrap();
+        let mut entry_buf = Vec::with_capacity(7 + key_len + value_len);
+        entry_buf.write_u16::<BigEndian>(key_len as u16).unwrap();
         entry_buf.write_u8(op_type.to_byte()).unwrap();
         entry_buf.write_u32::<BigEndian>(value_len as u32).unwrap();
-        entry_buf.extend_from_slice(&key[shared_prefix_len..]);
+        entry_buf.extend_from_slice(key);
         if let Some(v) = value {
             entry_buf.extend_from_slice(v);
         }
 
         self.buffer.extend_from_slice(&entry_buf);
-
-        self.last_key.clear();
-        self.last_key.extend_from_slice(key);
         self.entry_count += 1;
     }
 
-    pub fn finish(mut self) -> Vec<u8> {
-        for pos in &self.restart_positions {
-            self.buffer.write_u32::<BigEndian>(*pos).unwrap();
-        }
-        self.buffer
-            .write_u32::<BigEndian>(self.restart_positions.len() as u32)
-            .unwrap();
+    pub fn finish(self) -> Vec<u8> {
         self.buffer
     }
 
@@ -107,50 +81,17 @@ impl Builder {
     pub fn entry_count(&self) -> usize {
         self.entry_count
     }
-
-    fn shared_prefix_length(&self, a: &[u8], b: &[u8]) -> usize {
-        a.iter().zip(b.iter()).take_while(|&(a, b)| a == b).count()
-    }
 }
 
-// --- Block (Simplified `get` method) ---
+// --- Block ---
 #[derive(Clone)]
 pub struct Block {
     data: Vec<u8>,
-    restart_positions: Vec<u32>,
 }
 
 impl Block {
     pub fn new(data: Vec<u8>) -> Result<Self> {
-        use std::io::Cursor;
-
-        let data_len = data.len();
-        if data_len < 4 {
-            return Err(Error::InvalidData("Block data too short".to_string()));
-        }
-
-        let num_restarts_offset = data_len - 4;
-        let mut cursor = Cursor::new(&data[num_restarts_offset..]);
-        let num_restarts = cursor.read_u32::<BigEndian>()? as usize;
-
-        let restart_array_size = num_restarts * 4;
-        if num_restarts_offset < restart_array_size {
-            return Err(Error::InvalidData(
-                "Data too short for restart positions".to_string(),
-            ));
-        }
-
-        let restart_array_offset = num_restarts_offset - restart_array_size;
-        let mut cursor = Cursor::new(&data[restart_array_offset..num_restarts_offset]);
-        let mut restart_positions = Vec::with_capacity(num_restarts);
-        for _ in 0..num_restarts {
-            restart_positions.push(cursor.read_u32::<BigEndian>()?);
-        }
-
-        Ok(Self {
-            data: data[..restart_array_offset].to_vec(),
-            restart_positions,
-        })
+        Ok(Self { data })
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -171,109 +112,120 @@ impl Block {
     }
 }
 
-// --- BlockIterator (Refactored `seek` and helpers) ---
+// --- BlockIterator ---
 pub struct BlockIterator {
     block: Arc<Block>,
     current_offset: usize,
-    last_key: Vec<u8>,
+    // Lazy offset tracking for reverse iteration
+    entry_offsets: Vec<usize>,
+    backward_index: Option<usize>,
+    backward_initialized: bool,
 }
 
 impl BlockIterator {
     pub fn new(block: Arc<Block>) -> Self {
-        let initial_offset = block.restart_positions.first().map_or(0, |&p| p as usize);
         Self {
             block,
-            current_offset: initial_offset,
-            last_key: Vec::new(),
+            current_offset: 0,
+            entry_offsets: vec![0], // Start with first entry at offset 0
+            backward_index: None,
+            backward_initialized: false,
         }
     }
 
     /// Helper to read just the key at a given offset for comparisons.
-    /// It does not modify the iterator's state.
+    /// Format: [key_len:u16][op:u8][value_len:u32][key][value]
     fn read_key_at(&self, offset: usize) -> Result<Vec<u8>> {
         let mut pos = offset;
         let data = &self.block.data;
 
-        // A restart point key has no shared prefix.
-        let shared_len = (&data[pos..]).read_u16::<BigEndian>()? as usize;
-        pos += 2;
-        let unshared_len = (&data[pos..]).read_u16::<BigEndian>()? as usize;
+        let key_len = (&data[pos..]).read_u16::<BigEndian>()? as usize;
         pos += 2;
         let _op_type = OpType::from_byte((&data[pos..]).read_u8()?)?;
         pos += 1;
         let value_len = (&data[pos..]).read_u32::<BigEndian>()? as usize;
         pos += 4;
 
-        if shared_len != 0 {
-            return Err(Error::InvalidData(
-                "Restart point key has a shared prefix".into(),
-            ));
-        }
-        if pos + unshared_len + value_len > data.len() {
+        if pos + key_len + value_len > data.len() {
             return Err(Error::InvalidData("Entry out of bounds".into()));
         }
 
-        Ok(data[pos..pos + unshared_len].to_vec())
+        Ok(data[pos..pos + key_len].to_vec())
     }
 
     /// Seeks the iterator to the first key that is >= `target`.
     /// Positions the iterator so that the next call to `next()` will return
     /// the first key >= target, or None if no such key exists.
     pub fn seek(&mut self, target: &[u8]) -> Result<()> {
-        // Store all positions and keys from the current restart point to target
-        let mut entries_to_target = Vec::new();
+        // Reset to beginning
+        self.current_offset = 0;
 
-        // 1. Binary search restart points to find the right region.
-        let mut left = 0;
-        let mut right = self.block.restart_positions.len();
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            match self.read_key_at(self.block.restart_positions[mid] as usize) {
-                Ok(key) => match key.as_slice().cmp(target) {
-                    Ordering::Less => left = mid + 1,
-                    _ => right = mid,
-                },
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Declare and initialize restart_index just before it's needed.
-        let restart_index = left.saturating_sub(1);
-
-        // 2. Position the iterator at the found restart point.
-        self.current_offset = self.block.restart_positions[restart_index] as usize;
-        self.last_key.clear();
-
-        // 3. Scan from restart point, collecting entries until we find target
-        while let Some(result) = self.next() {
-            match result {
-                Ok((key, value)) => {
+        // Linear scan to find first key >= target
+        let mut temp_offset = 0;
+        while temp_offset < self.block.data.len() {
+            match self.read_key_at(temp_offset) {
+                Ok(key) => {
                     if key.as_slice() >= target {
-                        // Found the target! Now we need to position iterator
-                        // to return this entry on the next `next()` call.
-
-                        // Reset to restart point
-                        self.current_offset = self.block.restart_positions[restart_index] as usize;
-                        self.last_key.clear();
-
-                        // Advance through all the entries before our target
-                        for _ in &entries_to_target {
-                            self.next(); // Consume the entries before target
-                        }
-
+                        // Found it, position iterator here
+                        self.current_offset = temp_offset;
                         return Ok(());
                     }
-                    // Store this entry and continue
-                    entries_to_target.push((key, value));
+                    // Skip to next entry
+                    temp_offset += self.entry_size_at(temp_offset)?;
                 }
-                Err(e) => return Err(e),
+                Err(_) => {
+                    // Reached end or error
+                    self.current_offset = self.block.data.len();
+                    return Ok(());
+                }
             }
         }
 
-        // If we get here, no key >= target was found
-        // Iterator is already positioned at end, so next() will return None
+        // No key >= target found
+        self.current_offset = self.block.data.len();
         Ok(())
+    }
+
+    /// Calculate the size of an entry at a given offset
+    fn entry_size_at(&self, offset: usize) -> Result<usize> {
+        let data = &self.block.data;
+        let mut pos = offset;
+
+        let key_len = (&data[pos..]).read_u16::<BigEndian>()? as usize;
+        pos += 2;
+        let _op_type = (&data[pos..]).read_u8()?;
+        pos += 1;
+        let value_len = (&data[pos..]).read_u32::<BigEndian>()? as usize;
+
+        Ok(7 + key_len + value_len)
+    }
+
+    /// Helper to parse a complete entry at the given offset.
+    /// Returns (key, value).
+    fn read_entry_at(&self, offset: usize) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+        let mut pos = offset;
+        let data = &self.block.data;
+
+        let key_len = (&data[pos..]).read_u16::<BigEndian>()? as usize;
+        pos += 2;
+        let op_type = OpType::from_byte((&data[pos..]).read_u8()?)?;
+        pos += 1;
+        let value_len = (&data[pos..]).read_u32::<BigEndian>()? as usize;
+        pos += 4;
+
+        if pos + key_len + value_len > data.len() {
+            return Err(Error::InvalidData("Entry out of bounds".into()));
+        }
+
+        let key = data[pos..pos + key_len].to_vec();
+        pos += key_len;
+
+        let value = match op_type {
+            OpType::Delete => None,
+            OpType::Put => Some(data[pos..pos + value_len].to_vec()),
+        };
+
+        Ok((key, value))
     }
 }
 
@@ -282,8 +234,15 @@ impl BlockIterator {
 pub struct MultiBlockIterator {
     reader: std::fs::File,
     blocks: Vec<(u64, u64)>, // Block offset and size
+
+    // Forward iteration state
     current_block_iter: Option<BlockIterator>,
     current_block_index: usize,
+
+    // Backward iteration state (lazy initialization)
+    backward_block_iter: Option<BlockIterator>,
+    backward_block_index: Option<usize>,
+    backward_initialized: bool,
 }
 
 impl MultiBlockIterator {
@@ -293,13 +252,16 @@ impl MultiBlockIterator {
             blocks,
             current_block_iter: None,
             current_block_index: 0,
+            backward_block_iter: None,
+            backward_block_index: None,
+            backward_initialized: false,
         })
     }
 
     /// Seek to the first key >= target in the first block
     pub fn seek_first_block(&mut self, target: &[u8]) -> Result<()> {
         if !self.blocks.is_empty() && self.current_block_index == 0 {
-            self.load_current_block()?;
+            self.load_forward_block()?;
             if let Some(iter) = &mut self.current_block_iter {
                 iter.seek(target)?;
             }
@@ -307,7 +269,7 @@ impl MultiBlockIterator {
         Ok(())
     }
 
-    fn load_current_block(&mut self) -> Result<()> {
+    fn load_forward_block(&mut self) -> Result<()> {
         if self.current_block_index >= self.blocks.len() {
             self.current_block_iter = None;
             return Ok(());
@@ -327,6 +289,36 @@ impl MultiBlockIterator {
 
         Ok(())
     }
+
+    fn load_backward_block(&mut self) -> Result<()> {
+        // Get the backward block index (already decremented by caller)
+        let idx = match self.backward_block_index {
+            Some(i) => i,
+            None => {
+                self.backward_block_iter = None;
+                return Ok(());
+            }
+        };
+
+        if idx >= self.blocks.len() {
+            self.backward_block_iter = None;
+            return Ok(());
+        }
+
+        // Get the block's offset and size
+        let (offset, size) = self.blocks[idx];
+
+        // Read the block using a cloned file handle
+        let mut reader = self.reader.try_clone()?;
+        let mut block_data = vec![0u8; size as usize];
+        reader.seek(SeekFrom::Start(offset))?;
+        reader.read_exact(&mut block_data)?;
+
+        let block = std::sync::Arc::new(Block::new(block_data)?);
+        self.backward_block_iter = Some(block.iter());
+
+        Ok(())
+    }
 }
 
 impl Iterator for MultiBlockIterator {
@@ -342,7 +334,7 @@ impl Iterator for MultiBlockIterator {
             }
 
             // Current block iterator is exhausted, load the next block
-            if let Err(e) = self.load_current_block() {
+            if let Err(e) = self.load_forward_block() {
                 return Some(Err(e));
             }
 
@@ -352,66 +344,139 @@ impl Iterator for MultiBlockIterator {
     }
 }
 
+impl DoubleEndedIterator for MultiBlockIterator {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        // Lazy initialization: set backward block index on first call
+        if !self.backward_initialized {
+            self.backward_initialized = true;
+            if self.blocks.is_empty() {
+                return None;
+            }
+            // Start from the last block
+            self.backward_block_index = Some(self.blocks.len() - 1);
+            // Load the last block
+            if let Err(e) = self.load_backward_block() {
+                return Some(Err(e));
+            }
+        }
+
+        loop {
+            // Try to get the previous entry from the current backward block iterator
+            if let Some(iter) = &mut self.backward_block_iter {
+                if let Some(entry) = iter.next_back() {
+                    return Some(entry);
+                }
+            }
+
+            // Current block iterator is exhausted, move to previous block
+            match self.backward_block_index {
+                Some(0) => {
+                    // We're at the first block and it's exhausted
+                    self.backward_block_index = None;
+                    return None;
+                }
+                Some(idx) => {
+                    // Move to previous block
+                    self.backward_block_index = Some(idx - 1);
+                    if let Err(e) = self.load_backward_block() {
+                        return Some(Err(e));
+                    }
+                }
+                None => {
+                    // Already exhausted
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 impl Iterator for BlockIterator {
     type Item = Result<(Vec<u8>, Option<Vec<u8>>)>;
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_offset >= self.block.data.len() {
             return None;
         }
 
-        let mut pos = self.current_offset;
-        let data = &self.block.data;
-
-        macro_rules! try_read {
-            ($expr:expr, $field:expr) => {
-                match $expr {
-                    Ok(val) => val,
-                    Err(e) => {
-                        return Some(Err(Error::InvalidData(format!(
-                            "Failed to decode {}: {}",
-                            $field, e
-                        ))))
-                    }
-                }
-            };
-        }
-
-        let shared_len = try_read!((&data[pos..]).read_u16::<BigEndian>(), "shared_len") as usize;
-        pos += 2;
-        let unshared_len =
-            try_read!((&data[pos..]).read_u16::<BigEndian>(), "unshared_len") as usize;
-        pos += 2;
-        let op_type_byte = try_read!((&data[pos..]).read_u8(), "op_type");
-        let op_type = try_read!(OpType::from_byte(op_type_byte), "op_type");
-        pos += 1;
-        let value_len = try_read!((&data[pos..]).read_u32::<BigEndian>(), "value_len") as usize;
-        pos += 4;
-
-        if shared_len > self.last_key.len() || pos + unshared_len + value_len > data.len() {
-            return Some(Err(Error::InvalidData("Block entry out of bounds".into())));
-        }
-
-        let mut key = Vec::with_capacity(shared_len + unshared_len);
-        key.extend_from_slice(&self.last_key[..shared_len]);
-        key.extend_from_slice(&data[pos..pos + unshared_len]);
-        pos += unshared_len;
-
-        let value = match op_type {
-            OpType::Delete => None, // Return None for tombstones
-            OpType::Put => Some(data[pos..pos + value_len].to_vec()),
+        // Read entry at current offset
+        let entry = match self.read_entry_at(self.current_offset) {
+            Ok(e) => e,
+            Err(e) => return Some(Err(e)),
         };
-        pos += value_len;
 
-        self.current_offset = pos;
-        self.last_key = key.clone();
+        // Calculate next offset
+        let entry_size = match self.entry_size_at(self.current_offset) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
 
-        Some(Ok((key, value)))
+        let next_offset = self.current_offset + entry_size;
+
+        // Track offset for reverse iteration
+        if next_offset < self.block.data.len() {
+            self.entry_offsets.push(next_offset);
+        }
+
+        self.current_offset = next_offset;
+
+        Some(Ok(entry))
+    }
+}
+
+impl DoubleEndedIterator for BlockIterator {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        // Lazy initialization: scan block to build full offset index on first call
+        if !self.backward_initialized {
+            self.backward_initialized = true;
+
+            // Build offset index by scanning through block metadata only
+            let mut offset = self.current_offset;
+            while offset < self.block.data.len() {
+                let size = match self.entry_size_at(offset) {
+                    Ok(s) => s,
+                    Err(e) => return Some(Err(e)),
+                };
+                offset += size;
+                if offset < self.block.data.len() {
+                    self.entry_offsets.push(offset);
+                }
+            }
+
+            // Position backward_index at last entry
+            if self.entry_offsets.len() > 1 {
+                self.backward_index = Some(self.entry_offsets.len() - 1);
+            } else {
+                return None; // Empty block
+            }
+        }
+
+        // Get current backward index
+        let idx = self.backward_index?;
+
+        // Read entry at this offset using existing helper
+        let offset = self.entry_offsets[idx];
+        let entry = match self.read_entry_at(offset) {
+            Ok(e) => e,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Move backward or mark exhausted
+        if idx == 0 {
+            self.backward_index = None; // Exhausted after this
+        } else {
+            self.backward_index = Some(idx - 1);
+        }
+
+        Some(Ok(entry))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::Write;
 
     #[test]
     fn test_block_builder_and_reader() {
@@ -451,5 +516,283 @@ mod tests {
         iter.seek(b"bana").unwrap();
         let (found_key, _) = iter.next().unwrap().unwrap();
         assert_eq!(found_key, b"banana");
+    }
+
+    #[test]
+    fn test_block_reverse_iteration() {
+        let mut builder = Builder::new();
+        let entries = vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+            (b"c".to_vec(), b"3".to_vec()),
+            (b"d".to_vec(), b"4".to_vec()),
+        ];
+
+        for (key, value) in &entries {
+            builder.add_entry(key, Some(value));
+        }
+        let block_data = builder.finish();
+        let block = Arc::new(Block::new(block_data).expect("Failed to create block"));
+
+        // Test reverse iteration
+        let mut iter = block.iter();
+
+        // Read from back
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"d".to_vec(), Some(b"4".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"c".to_vec(), Some(b"3".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"b".to_vec(), Some(b"2".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"a".to_vec(), Some(b"1".to_vec()))
+        );
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_block_mixed_iteration() {
+        let mut builder = Builder::new();
+        let entries = vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+            (b"c".to_vec(), b"3".to_vec()),
+            (b"d".to_vec(), b"4".to_vec()),
+            (b"e".to_vec(), b"5".to_vec()),
+        ];
+
+        for (key, value) in &entries {
+            builder.add_entry(key, Some(value));
+        }
+        let block_data = builder.finish();
+        let block = Arc::new(Block::new(block_data).expect("Failed to create block"));
+
+        let mut iter = block.iter();
+
+        // Forward
+        assert_eq!(
+            iter.next().unwrap().unwrap(),
+            (b"a".to_vec(), Some(b"1".to_vec()))
+        );
+        assert_eq!(
+            iter.next().unwrap().unwrap(),
+            (b"b".to_vec(), Some(b"2".to_vec()))
+        );
+
+        // Backward (should scan to end first, then return from back)
+        // Note: Calling next_back() scans the ENTIRE block, so all entries are available
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"e".to_vec(), Some(b"5".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"d".to_vec(), Some(b"4".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"c".to_vec(), Some(b"3".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"b".to_vec(), Some(b"2".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"a".to_vec(), Some(b"1".to_vec()))
+        );
+
+        // Now exhausted
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_multiblock_reverse_iteration() {
+        use crate::tmpfs::NamedTempFile;
+
+        // Create a temporary file for the SSTable
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path();
+
+        // Create multiple blocks with entries
+        let mut file = File::create(path).expect("Failed to create file");
+        let mut blocks = Vec::new();
+
+        // Block 1: keys a, b, c
+        let mut builder1 = Builder::new();
+        builder1.add_entry(b"a", Some(b"1"));
+        builder1.add_entry(b"b", Some(b"2"));
+        builder1.add_entry(b"c", Some(b"3"));
+        let block1_data = builder1.finish();
+        let block1_offset = 0u64;
+        let block1_size = block1_data.len() as u64;
+        file.write_all(&block1_data)
+            .expect("Failed to write block 1");
+        blocks.push((block1_offset, block1_size));
+
+        // Block 2: keys d, e, f
+        let mut builder2 = Builder::new();
+        builder2.add_entry(b"d", Some(b"4"));
+        builder2.add_entry(b"e", Some(b"5"));
+        builder2.add_entry(b"f", Some(b"6"));
+        let block2_data = builder2.finish();
+        let block2_offset = block1_size;
+        let block2_size = block2_data.len() as u64;
+        file.write_all(&block2_data)
+            .expect("Failed to write block 2");
+        blocks.push((block2_offset, block2_size));
+
+        // Block 3: keys g, h, i
+        let mut builder3 = Builder::new();
+        builder3.add_entry(b"g", Some(b"7"));
+        builder3.add_entry(b"h", Some(b"8"));
+        builder3.add_entry(b"i", Some(b"9"));
+        let block3_data = builder3.finish();
+        let block3_offset = block2_offset + block2_size;
+        let block3_size = block3_data.len() as u64;
+        file.write_all(&block3_data)
+            .expect("Failed to write block 3");
+        blocks.push((block3_offset, block3_size));
+
+        drop(file);
+
+        // Open file for reading
+        let reader = File::open(path).expect("Failed to open file");
+        let mut iter = MultiBlockIterator::new(reader, blocks).expect("Failed to create iterator");
+
+        // Test pure reverse iteration
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"i".to_vec(), Some(b"9".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"h".to_vec(), Some(b"8".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"g".to_vec(), Some(b"7".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"f".to_vec(), Some(b"6".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"e".to_vec(), Some(b"5".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"d".to_vec(), Some(b"4".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"c".to_vec(), Some(b"3".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"b".to_vec(), Some(b"2".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"a".to_vec(), Some(b"1".to_vec()))
+        );
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_multiblock_mixed_iteration() {
+        use crate::tmpfs::NamedTempFile;
+
+        // Create a temporary file for the SSTable
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path();
+
+        // Create multiple blocks with entries
+        let mut file = File::create(path).expect("Failed to create file");
+        let mut blocks = Vec::new();
+
+        // Block 1: keys a, b
+        let mut builder1 = Builder::new();
+        builder1.add_entry(b"a", Some(b"1"));
+        builder1.add_entry(b"b", Some(b"2"));
+        let block1_data = builder1.finish();
+        let block1_offset = 0u64;
+        let block1_size = block1_data.len() as u64;
+        file.write_all(&block1_data)
+            .expect("Failed to write block 1");
+        blocks.push((block1_offset, block1_size));
+
+        // Block 2: keys c, d
+        let mut builder2 = Builder::new();
+        builder2.add_entry(b"c", Some(b"3"));
+        builder2.add_entry(b"d", Some(b"4"));
+        let block2_data = builder2.finish();
+        let block2_offset = block1_size;
+        let block2_size = block2_data.len() as u64;
+        file.write_all(&block2_data)
+            .expect("Failed to write block 2");
+        blocks.push((block2_offset, block2_size));
+
+        // Block 3: keys e, f
+        let mut builder3 = Builder::new();
+        builder3.add_entry(b"e", Some(b"5"));
+        builder3.add_entry(b"f", Some(b"6"));
+        let block3_data = builder3.finish();
+        let block3_offset = block2_offset + block2_size;
+        let block3_size = block3_data.len() as u64;
+        file.write_all(&block3_data)
+            .expect("Failed to write block 3");
+        blocks.push((block3_offset, block3_size));
+
+        drop(file);
+
+        // Open file for reading
+        let reader = File::open(path).expect("Failed to open file");
+        let mut iter = MultiBlockIterator::new(reader, blocks).expect("Failed to create iterator");
+
+        // Forward first
+        assert_eq!(
+            iter.next().unwrap().unwrap(),
+            (b"a".to_vec(), Some(b"1".to_vec()))
+        );
+        assert_eq!(
+            iter.next().unwrap().unwrap(),
+            (b"b".to_vec(), Some(b"2".to_vec()))
+        );
+
+        // Then backward (should scan from current position to end, then iterate back)
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"f".to_vec(), Some(b"6".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"e".to_vec(), Some(b"5".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"d".to_vec(), Some(b"4".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"c".to_vec(), Some(b"3".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"b".to_vec(), Some(b"2".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"a".to_vec(), Some(b"1".to_vec()))
+        );
+        assert!(iter.next_back().is_none());
     }
 }

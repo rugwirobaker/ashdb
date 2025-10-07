@@ -241,6 +241,9 @@ pub struct MemtableIterator {
     memtable: Arc<Memtable>,
     current_key: Option<Vec<u8>>,
     exhausted: bool,
+    // Backward iteration state
+    current_back_key: Option<Vec<u8>>,
+    exhausted_backward: bool,
 }
 
 impl MemtableIterator {
@@ -249,6 +252,8 @@ impl MemtableIterator {
             memtable,
             current_key: None,
             exhausted: false,
+            current_back_key: None,
+            exhausted_backward: false,
         }
     }
 }
@@ -284,6 +289,42 @@ impl Iterator for MemtableIterator {
             }
             None => {
                 self.exhausted = true;
+                None
+            }
+        }
+    }
+}
+
+impl DoubleEndedIterator for MemtableIterator {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.exhausted_backward {
+            return None;
+        }
+
+        // Create a range ending at current_back_key
+        let range = match &self.current_back_key {
+            Some(key) => {
+                use std::ops::Bound;
+                (Bound::Unbounded, Bound::Excluded(key.clone()))
+            }
+            None => {
+                use std::ops::Bound;
+                (Bound::Unbounded, Bound::Unbounded)
+            }
+        };
+
+        // Get previous entry using a fresh SkipMap range in reverse
+        let mut range_iter = self.memtable.data.range(range);
+        // Use next_back() to traverse from the end of the range
+        match range_iter.next_back() {
+            Some(entry) => {
+                let key = entry.key().clone();
+                let value = entry.value().clone(); // Keep as Option<Vec<u8>>
+                self.current_back_key = Some(key.clone());
+                Some(Ok((key, value)))
+            }
+            None => {
+                self.exhausted_backward = true;
                 None
             }
         }
@@ -491,5 +532,121 @@ mod tests {
                 _ => panic!("Unexpected entry in WAL"),
             }
         }
+    }
+
+    #[test]
+    fn test_memtable_iterator_reverse() {
+        let temp_dir = create_temp_dir();
+        let memtable = create_temp_memtable(&temp_dir);
+
+        // Add entries
+        memtable
+            .put(b"key1".to_vec(), Some(b"value1".to_vec()))
+            .expect("Put failed");
+        memtable
+            .put(b"key2".to_vec(), Some(b"value2".to_vec()))
+            .expect("Put failed");
+        memtable
+            .put(b"key3".to_vec(), Some(b"value3".to_vec()))
+            .expect("Put failed");
+
+        // Test reverse iteration
+        let mut iter = MemtableIterator::new(Arc::new(memtable));
+
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"key3".to_vec(), Some(b"value3".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"key2".to_vec(), Some(b"value2".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"key1".to_vec(), Some(b"value1".to_vec()))
+        );
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_memtable_iterator_mixed() {
+        let temp_dir = create_temp_dir();
+        let memtable = create_temp_memtable(&temp_dir);
+
+        // Add more entries to better test mixed iteration
+        memtable
+            .put(b"key1".to_vec(), Some(b"value1".to_vec()))
+            .expect("Put failed");
+        memtable
+            .put(b"key2".to_vec(), Some(b"value2".to_vec()))
+            .expect("Put failed");
+        memtable
+            .put(b"key3".to_vec(), Some(b"value3".to_vec()))
+            .expect("Put failed");
+        memtable
+            .put(b"key4".to_vec(), Some(b"value4".to_vec()))
+            .expect("Put failed");
+        memtable
+            .put(b"key5".to_vec(), Some(b"value5".to_vec()))
+            .expect("Put failed");
+
+        // Test that forward and backward iterations work independently
+        // Note: forward and backward iterations maintain separate cursors
+        let mut iter = MemtableIterator::new(Arc::new(memtable));
+
+        // Get first from front
+        assert_eq!(iter.next().unwrap().unwrap().0, b"key1".to_vec());
+
+        // Get first from back
+        assert_eq!(iter.next_back().unwrap().unwrap().0, b"key5".to_vec());
+
+        // Continue from front
+        assert_eq!(iter.next().unwrap().unwrap().0, b"key2".to_vec());
+
+        // Continue from back
+        assert_eq!(iter.next_back().unwrap().unwrap().0, b"key4".to_vec());
+
+        // At this point:
+        // - Forward cursor is after key2, will see key3, key4, key5
+        // - Backward cursor is before key4, will see key3, key2, key1
+
+        // Both will see key3
+        assert_eq!(iter.next().unwrap().unwrap().0, b"key3".to_vec());
+        assert_eq!(iter.next_back().unwrap().unwrap().0, b"key3".to_vec());
+    }
+
+    #[test]
+    fn test_memtable_scan_reverse() {
+        let temp_dir = create_temp_dir();
+        let memtable = create_temp_memtable(&temp_dir);
+
+        // Add entries
+        memtable
+            .put(b"key1".to_vec(), Some(b"value1".to_vec()))
+            .expect("Put failed");
+        memtable
+            .put(b"key2".to_vec(), Some(b"value2".to_vec()))
+            .expect("Put failed");
+        memtable
+            .put(b"key3".to_vec(), Some(b"value3".to_vec()))
+            .expect("Put failed");
+        memtable
+            .put(b"key4".to_vec(), Some(b"value4".to_vec()))
+            .expect("Put failed");
+
+        // Test range scan with reverse iteration
+        let range = b"key2".to_vec()..=b"key3".to_vec();
+        let mut iter = memtable.scan(range).expect("Scan failed");
+
+        // Reverse iteration should return key3, then key2
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"key3".to_vec(), Some(b"value3".to_vec()))
+        );
+        assert_eq!(
+            iter.next_back().unwrap().unwrap(),
+            (b"key2".to_vec(), Some(b"value2".to_vec()))
+        );
+        assert!(iter.next_back().is_none());
     }
 }

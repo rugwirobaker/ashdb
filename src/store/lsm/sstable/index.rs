@@ -1,4 +1,5 @@
 //! Sparse index implementation for efficient SSTable block lookup.
+//! it stores the location of the first key in a block
 
 use std::convert::TryFrom;
 use std::io::{Read, Write};
@@ -47,7 +48,7 @@ impl Index {
     /// is found, it returns the corresponding entry. Otherwise, it returns the
     /// entry for the block that *precedes* the block where the key would be, which
     /// is the correct block to search.
-    pub fn find(&self, key: &[u8]) -> Option<Entry> {
+    pub fn find(&self, key: &[u8]) -> Option<Entry<'_>> {
         let mut low = 0;
         let mut high = self.entries.len();
 
@@ -123,8 +124,6 @@ impl Index {
 }
 
 impl Index {
-    // In src/store/lsm/sstable/index.rs
-
     pub fn range(&self, range: impl RangeBounds<Vec<u8>>) -> Vec<(u64, u64)> {
         let start_index = match range.start_bound() {
             std::ops::Bound::Included(start) => {

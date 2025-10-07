@@ -2,8 +2,11 @@ pub mod bincode;
 pub mod format;
 pub mod keycode;
 
+use std::collections::{BTreeSet, HashSet};
+use std::hash::Hash;
+
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
@@ -12,14 +15,14 @@ use crate::error::Result;
 /// Keys must maintain lexicographic ordering after encoding to support
 /// efficient range scans. This trait uses the keycode module for
 /// order-preserving serialization.
-pub trait Key: Serialize + DeserializeOwned {
+pub trait Key<'de>: Serialize + Deserialize<'de> {
     /// Encode the key to bytes while preserving sort order
     fn encode(&self) -> Vec<u8> {
         keycode::serialize(self)
     }
 
     /// Decode bytes back to the original key type
-    fn decode(bytes: &[u8]) -> Result<Self> {
+    fn decode(bytes: &'de [u8]) -> Result<Self> {
         keycode::deserialize(bytes)
     }
 }
@@ -41,31 +44,9 @@ pub trait Value: Serialize + DeserializeOwned {
 }
 
 // Blanket implementations for common types that can be used as keys
-impl Key for bool {}
-impl Key for i64 {}
-impl Key for u64 {}
-impl Key for f64 {}
-impl Key for String {}
-impl Key for Vec<u8> {}
-
-// Blanket implementations for common types that can be used as values
-impl<T> Value for T where T: Serialize + DeserializeOwned {}
-
-// Additional key implementations for tuples (commonly used in composite keys)
-impl<A: Serialize + DeserializeOwned> Key for (A,) {}
-impl<A: Serialize + DeserializeOwned, B: Serialize + DeserializeOwned> Key for (A, B) {}
-impl<
-        A: Serialize + DeserializeOwned,
-        B: Serialize + DeserializeOwned,
-        C: Serialize + DeserializeOwned,
-    > Key for (A, B, C)
-{
-}
-impl<
-        A: Serialize + DeserializeOwned,
-        B: Serialize + DeserializeOwned,
-        C: Serialize + DeserializeOwned,
-        D: Serialize + DeserializeOwned,
-    > Key for (A, B, C, D)
-{
-}
+impl<V: Value> Value for Option<V> {}
+impl<V: Value> Value for Result<V> {}
+impl<V: Value> Value for Vec<V> {}
+impl<V1: Value, V2: Value> Value for (V1, V2) {}
+impl<V: Value + Eq + Hash> Value for HashSet<V> {}
+impl<V: Value + Eq + Ord + Hash> Value for BTreeSet<V> {}

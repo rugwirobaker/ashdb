@@ -1,32 +1,9 @@
 // src/store/lsm/sstable/table.rs
 
-//! This module manages the lifecycle of an SSTable file, from creation and
-//! writing to opening and reading.
+//! SSTable file lifecycle management and operations.
 //!
-//! ## SSTable File Layout
-//!
-//! An SSTable file consists of three major sections: a sequence of data blocks,
-//! an index block, and a footer containing the offset of the index block.
-//!
-//! ```text
-//! +-------------------+
-//! | Data Block 1      |
-//! +-------------------+
-//! | Data Block 2      |
-//! +-------------------+
-//! | ...               |
-//! +-------------------+
-//! | Data Block N      |
-//! +-------------------+
-//! | Index Block       |
-//! +-------------------+
-//! | Index Offset (u64)|
-//! +-------------------+
-//! ```
-//!
-//! The `Table` enum represents an SSTable and can be in one of two states:
-//! `Writable` for building a new table, or `Readable` for querying an existing one.
-//!
+//! This module provides typestate-based SSTable construction and querying,
+//! ensuring operations are only available in valid states.
 use super::super::filter::RangeFilter;
 use super::block::{Block, MultiBlockIterator};
 use super::index::Index;
@@ -285,8 +262,6 @@ mod tests {
             assert_eq!(result, value, "Value mismatch for key {:?}", key);
         }
     }
-
-    // src/store/lsm/sstable/table.rs
 
     #[test]
     fn test_scan() {
@@ -628,7 +603,8 @@ mod tests {
                     let end_key_bytes = format!("key_{:04}", end_idx - 1).into_bytes();
 
                     assert!(
-                        key.as_slice() >= start_key_bytes.as_slice() && key.as_slice() <= end_key_bytes.as_slice(),
+                        key.as_slice() >= start_key_bytes.as_slice()
+                            && key.as_slice() <= end_key_bytes.as_slice(),
                         "Task {} key {:?} outside range [{:04}, {:04}]",
                         task_id,
                         String::from_utf8_lossy(&key),

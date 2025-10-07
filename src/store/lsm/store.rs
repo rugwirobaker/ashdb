@@ -115,8 +115,9 @@ impl Store for LsmTree {
         &'a self,
         range: impl RangeBounds<Vec<u8>> + Clone + Send + Sync + 'a,
     ) -> Self::ScanIterator<'a> {
-        type BoxedInternalIterator<'a> =
-            Box<dyn Iterator<Item = Result<(Vec<u8>, Option<Vec<u8>>)>> + Send + Sync + 'a>;
+        type BoxedInternalIterator<'a> = Box<
+            dyn DoubleEndedIterator<Item = Result<(Vec<u8>, Option<Vec<u8>>)>> + Send + Sync + 'a,
+        >;
 
         // Clone Arc to extend lifetime beyond lock
         let active = {
