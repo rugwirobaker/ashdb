@@ -4,7 +4,7 @@ use crate::error::Result;
 /// Collect metrics from LSM state and log them
 pub fn collect_metrics(state: &LsmState) -> Result<()> {
     // Collect metrics
-    let active_size = state.active_memtable.read().unwrap().size();
+    let active_size = state.active_memtable.load().size();
     let frozen_count = state.frozen_memtables.read().unwrap().len();
     let flush_pending = state
         .flush_pending

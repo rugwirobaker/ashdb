@@ -6,3 +6,5 @@ rocksdb-paper.pdf
 ashdb_data
 data
 cli_tests
+perf-data
+commit.md

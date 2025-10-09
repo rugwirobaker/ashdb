@@ -68,7 +68,7 @@ pub fn recover_memtables(dir: &Path) -> Result<MemtableRecovery> {
         None => {
             let wal_id = next_wal_id;
             next_wal_id += 1;
-            let wal_path = wal_dir.join(format!("{}.wal", wal_id));
+            let wal_path = super::super::store::wal_path(dir, wal_id);
             ActiveMemtable::new(wal_path.to_str().unwrap(), wal_id)?
         }
     };
@@ -79,7 +79,7 @@ pub fn recover_memtables(dir: &Path) -> Result<MemtableRecovery> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmpfs::TempDir;
+    use crate::{store::lsm::store, tmpfs::TempDir};
 
     #[test]
     fn test_recover_empty_wal_dir() -> Result<()> {
@@ -100,7 +100,7 @@ mod tests {
         std::fs::create_dir_all(&wal_dir)?;
 
         // Create a WAL with some data
-        let wal_path = wal_dir.join("0.wal");
+        let wal_path = store::wal_path(temp_dir.path(), 0);
         let wal = Wal::new(wal_path.to_str().unwrap())?;
         wal.append(b"key1", Some(b"value1"))?;
         wal.flush()?;
@@ -122,7 +122,7 @@ mod tests {
 
         // Create multiple WALs
         for i in 0..3 {
-            let wal_path = wal_dir.join(format!("{}.wal", i));
+            let wal_path = store::wal_path(temp_dir.path(), i);
             let wal = Wal::new(wal_path.to_str().unwrap())?;
             wal.append(
                 format!("key{}", i).as_bytes(),

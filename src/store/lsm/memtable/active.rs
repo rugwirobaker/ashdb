@@ -1,14 +1,11 @@
 use super::super::wal::Wal;
 use super::{core::Memtable, core::ScanIterator, frozen::FrozenMemtable};
 use crate::error::Result;
-use std::{
-    ops::RangeBounds,
-    sync::{Arc, RwLock},
-};
+use std::{ops::RangeBounds, sync::Arc};
 
 pub struct ActiveMemtable {
     memtable: Arc<Memtable>,
-    wal: Arc<RwLock<Wal>>,
+    wal: Arc<Wal>,
     wal_id: u64,
 }
 
@@ -61,7 +58,7 @@ impl ActiveMemtable {
     }
 
     pub fn sync(&self) -> Result<()> {
-        self.wal.write().unwrap().flush()
+        self.wal.flush()
     }
 
     pub fn scan<R>(&self, range: R) -> Result<ScanIterator<R>>

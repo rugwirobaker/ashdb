@@ -6,14 +6,16 @@ use std::{
     },
 };
 
+use arc_swap::ArcSwap;
+
 use super::manifest::{Level, Manifest};
 use super::memtable::{ActiveMemtable, FrozenMemtable};
 use crate::error::Result;
 
 /// All mutable state for the LSM store with fine-grained locking
 pub struct LsmState {
-    // Write path (exclusive access needed)
-    pub active_memtable: RwLock<Arc<ActiveMemtable>>,
+    // Write path (lock-free atomic access)
+    pub active_memtable: ArcSwap<ActiveMemtable>,
     pub frozen_memtables: RwLock<VecDeque<FrozenMemtable>>,
 
     // Read path (concurrent reads)
@@ -40,7 +42,7 @@ impl LsmState {
         next_wal_id: u64,
     ) -> Self {
         Self {
-            active_memtable: RwLock::new(Arc::new(active_memtable)),
+            active_memtable: ArcSwap::new(Arc::new(active_memtable)),
             frozen_memtables: RwLock::new(frozen_memtables),
             levels: RwLock::new(levels),
             manifest: RwLock::new(manifest),
@@ -93,7 +95,7 @@ impl LsmState {
 
     /// Check if freeze is needed based on active memtable size
     pub fn needs_freeze(&self, max_size: usize) -> bool {
-        let active = self.active_memtable.read().unwrap();
+        let active = self.active_memtable.load();
         active.size() >= max_size
     }
 
@@ -176,7 +178,7 @@ impl LsmState {
     pub fn get_state_metrics(&self) -> StateMetrics {
         let levels = self.levels.read().unwrap();
         let frozen_memtables = self.frozen_memtables.read().unwrap();
-        let active_memtable = self.active_memtable.read().unwrap();
+        let active_memtable = self.active_memtable.load();
 
         StateMetrics {
             active_memtable_size: active_memtable.size(),

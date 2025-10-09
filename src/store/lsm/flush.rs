@@ -1,6 +1,7 @@
 use super::{
     manifest::{Level, SSTable},
     sstable::table,
+    wal::remove_wal_by_path,
 };
 use crate::error::Result;
 
@@ -94,7 +95,7 @@ pub async fn flush_memtable(store: &super::LsmTree) -> Result<bool> {
 
     // Delete WAL file (optional cleanup)
     let wal_path = store.wal_path(wal_id);
-    if let Err(e) = std::fs::remove_file(&wal_path) {
+    if let Err(e) = remove_wal_by_path(&wal_path) {
         tracing::warn!(wal_id = wal_id, error = %e, "Failed to delete WAL file");
     }
 

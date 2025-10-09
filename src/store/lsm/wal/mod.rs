@@ -39,29 +39,20 @@
 //!
 //! # IO Optimizations for Durability
 //!
-//! ## Direct IO for Write Guarantees
+//! ## Buffered IO with Preallocation and fdatasync
 //!
-//! The most critical optimization is using direct IO (`O_DIRECT`) to ensure
-//! writes reach disk immediately, bypassing kernel page cache:
+//! The WAL uses buffered I/O with kernel page cache for optimal performance:
 //!
-//! - **Durability certainty**: Writes are guaranteed on disk, not buffered in kernel pages
-//! - **No silent data loss**: Eliminates risk of losing "successful" writes during crashes
-//! - **Consistent sync behavior**: `sync()` operations have predictable effects
-//! - **True write-through**: Data persistence doesn't depend on kernel flush timing
+//! - **Buffered writes**: Uses `BufWriter` to coalesce small writes into larger syscalls
+//! - **Preallocation**: Uses `fallocate(FALLOC_FL_KEEP_SIZE)` to reduce metadata updates
+//! - **Data-only sync**: Uses `fdatasync()` (sync_data) instead of `fsync()` for faster durability
+//! - **Parent dir sync**: Syncs parent directory after create/unlink for crash safety
+//! - **Group commit ready**: Architecture prepared for future async I/O with io_uring
 //!
-//! This follows patterns from https://transactional.blog/how-to-learn/disk-io for
-//! reliable database IO. Future implementations may adopt additional patterns
-//! from that resource for even better IO handling.
-//!
-//! ## Write Throughput Optimization
-//!
-//! While maintaining durability, several techniques optimize write performance:
-//! - **Aligned writes**: Uses `AlignedWriter` to meet direct IO alignment requirements
-//! - **Batched operations**: Groups writes to amortize syscall overhead
-//! - **Append-only**: Sequential writes optimize for disk performance
-//! - **Configurable buffering**: Tunable buffer sizes for workload optimization
+//! Direct I/O requires custom I/O scheduling and framed layout to be effective.
+//! See: https://www.scylladb.com/2017/10/05/io-access-methods-scylla/
+//! We will add proper direct I/O support later with a custom I/O loop.
 
-pub mod aligned_writer;
 pub mod header;
 pub mod recovery;
 
@@ -73,19 +64,17 @@ use header::HEADER_SIZE;
 use crate::error::Result;
 use crate::Error;
 
-use aligned_writer::AlignedWriter;
 use crc::{Crc, CRC_32_ISCSI};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::RwLock;
-
-/// Type alias for WAL entry data (key, optional value)
-type WalEntry = (Vec<u8>, Option<Vec<u8>>);
 
 pub const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Type alias for WAL entry data (key, optional value)
+type WalEntry = (Vec<u8>, Option<Vec<u8>>);
 
 /// Operation type for WAL entries
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,36 +101,29 @@ impl OpType {
 }
 
 pub struct WalOptions {
-    pub use_direct_io: bool,
     pub buffer_size: usize,
+    pub prealloc_size: usize,
 }
 
 impl Default for WalOptions {
     fn default() -> Self {
         Self {
-            use_direct_io: false,
             buffer_size: DEFAULT_BUFFER_SIZE,
+            prealloc_size: 64 * 1024 * 1024, // 64 MB
         }
     }
 }
 
 // Represents a key-value pair or a delete operation in the WAL
+pub struct Wal {
+    writer: Mutex<BufWriter<File>>,
+    path: PathBuf,
+}
 
 impl std::fmt::Debug for Wal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Wal")
-            .field("path", &self.path)
-            .field("direct_io", &self.direct_io)
-            .finish()
+        f.debug_struct("Wal").field("path", &self.path).finish()
     }
-}
-
-pub struct Wal {
-    file: File,
-    writer: Mutex<Box<dyn Write + Send>>,
-    path: PathBuf,
-    header: RwLock<Header>,
-    direct_io: bool,
 }
 
 impl Wal {
@@ -150,53 +132,32 @@ impl Wal {
     }
 
     pub fn with_options(path: &str, opts: WalOptions) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        if opts.use_direct_io && opts.buffer_size % 4096 != 0 {
-            return Err(Error::InvalidInput(
-                "Buffer size must be aligned to 4096 bytes for direct IO".to_string(),
-            ));
-        }
-
         let mut open_opts = File::options();
         open_opts.create(true).read(true).write(true);
 
-        #[cfg(target_os = "linux")]
-        if opts.use_direct_io {
-            open_opts.custom_flags(libc::O_DIRECT);
+        let mut file = open_opts.open(path)?;
+
+        // Write or validate immutable header
+        if file.metadata()?.len() == 0 {
+            // New file: write header once
+            file.write_all(&Header::new().encode())?;
+            file.sync_data()?; // data-only sync is enough for WAL header
+            fsync_parent_dir(Path::new(path))?;
+        } else {
+            // Existing file: validate header
+            let mut buf = [0u8; HEADER_SIZE];
+            file.read_exact(&mut buf)?;
+            Header::decode(&buf)?;
         }
 
-        let file = open_opts.open(path)?;
+        // Preallocate the WAL segment to reduce metadata updates
+        preallocate(&file, opts.prealloc_size)?;
 
-        let writer: Box<dyn Write + Send> = if opts.use_direct_io {
-            Box::new(AlignedWriter::new(file.try_clone()?, opts.buffer_size)?)
-        } else {
-            Box::new(BufWriter::with_capacity(
-                opts.buffer_size,
-                file.try_clone()?,
-            ))
-        };
-
-        let header = if file.metadata()?.len() == 0 {
-            let h = Header::new();
-            let header_bytes = h.encode();
-            let mut f = file.try_clone()?;
-            f.write_all(&header_bytes)?;
-            f.sync_all()?;
-            h
-        } else {
-            let mut buf = [0u8; HEADER_SIZE];
-            let mut reader = file.try_clone()?;
-            reader.read_exact(&mut buf)?;
-            Header::decode(&buf)?
-        };
+        let writer = BufWriter::with_capacity(opts.buffer_size, file);
 
         Ok(Self {
-            file,
             writer: Mutex::new(writer),
             path: path.into(),
-            header: RwLock::new(header),
-            direct_io: opts.use_direct_io,
         })
     }
 
@@ -207,7 +168,9 @@ impl Wal {
     pub fn remove(self) -> Result<()> {
         let path = self.path.clone();
         // File handles are dropped here
-        Ok(std::fs::remove_file(path)?)
+        std::fs::remove_file(&path)?;
+        fsync_parent_dir(&path)?;
+        Ok(())
     }
 
     /// Returns the numeric ID of the WAL file, derived from its file name.
@@ -222,23 +185,24 @@ impl Wal {
 
     /// Returns the current size of the WAL file.
     pub fn size(&self) -> u64 {
-        self.file.metadata().map_or(0, |meta| meta.len())
-    }
-
-    pub fn entry_count(&self) -> u64 {
-        self.header.read().map(|h| h.entry_count).unwrap_or(0)
+        self.writer
+            .lock()
+            .ok()
+            .and_then(|w| w.get_ref().metadata().ok())
+            .map_or(0, |meta| meta.len())
     }
 }
 
 impl Wal {
     pub fn append(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
-        let mut payload = Vec::new();
-        let op_type = if value.is_some() {
+        // Build one contiguous record: [len:u32][payload...][crc:u32]
+        let mut payload = Vec::with_capacity(1 + 4 + 4 + key.len() + value.map_or(0, |v| v.len()));
+        let op = if value.is_some() {
             OpType::Put
         } else {
             OpType::Delete
         };
-        payload.write_u8(op_type.to_byte())?;
+        payload.write_u8(op.to_byte())?;
         payload.write_u32::<BigEndian>(key.len() as u32)?;
         payload.write_u32::<BigEndian>(value.map_or(0, |v| v.len()) as u32)?;
         payload.extend_from_slice(key);
@@ -246,16 +210,16 @@ impl Wal {
             payload.extend_from_slice(v);
         }
 
-        let checksum = CRC32.checksum(&payload);
+        let crc = CRC32.checksum(&payload);
 
-        let mut writer = self.writer.lock()?;
+        let mut record = Vec::with_capacity(4 + payload.len() + 4);
+        record.write_u32::<BigEndian>(payload.len() as u32)?;
+        record.extend_from_slice(&payload);
+        record.write_u32::<BigEndian>(crc)?;
 
-        writer.write_u32::<BigEndian>(payload.len() as u32)?;
-        writer.write_all(&payload)?;
-        writer.write_u32::<BigEndian>(checksum)?;
-
-        self.header.write()?.entry_count += 1;
-
+        // Single write into BufWriter (kernel will coalesce further)
+        let mut w = self.writer.lock().unwrap();
+        w.write_all(&record)?;
         Ok(())
     }
 
@@ -265,18 +229,9 @@ impl Wal {
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.writer.lock()?.flush()?;
-
-        let header = self.header.read()?;
-        let header_bytes = header.encode();
-        drop(header);
-
-        let mut file = self.file.try_clone()?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header_bytes)?;
-
-        file.sync_all()?;
-
+        let mut w = self.writer.lock()?;
+        w.flush()?; // push into kernel
+        w.get_ref().sync_data()?; // fdatasync on THE SAME fd the BufWriter owns
         Ok(())
     }
 }
@@ -374,11 +329,73 @@ impl Iterator for ReplayIterator {
     }
 }
 
+/// Preallocate space for a file using fallocate with FALLOC_FL_KEEP_SIZE on Linux.
+/// This allocates disk blocks without changing the file size, reducing metadata updates
+/// and filesystem fragmentation during writes.
+#[cfg(target_os = "linux")]
+fn preallocate(file: &File, bytes: usize) -> Result<()> {
+    use nix::fcntl::{fallocate, FallocateFlags};
+    use std::os::unix::io::AsRawFd;
+
+    if bytes == 0 {
+        return Ok(());
+    }
+
+    let fd = file.as_raw_fd();
+    match fallocate(fd, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, bytes as i64) {
+        Ok(_) => Ok(()),
+        // Gracefully handle filesystems that don't support fallocate
+        Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::EINVAL) => Ok(()),
+        Err(e) => Err(Error::IO(format!("fallocate failed: {}", e))),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preallocate(_file: &File, _bytes: usize) -> Result<()> {
+    // No-op on non-Linux platforms
+    Ok(())
+}
+
+/// Remove a WAL file by path and sync parent directory.
+/// Use this when you need to remove a WAL file without having the Wal object.
+pub fn remove_wal_by_path(path: &Path) -> Result<()> {
+    std::fs::remove_file(path)?;
+    fsync_parent_dir(path)?;
+    Ok(())
+}
+
+/// Sync parent directory to make file creation/deletion durable.
+/// This ensures that directory metadata changes (create, unlink, rename) survive crashes.
+fn fsync_parent_dir(path: &Path) -> Result<()> {
+    use std::fs::OpenOptions;
+
+    if let Some(dir) = path.parent() {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let dirfd = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(dir)?;
+            dirfd.sync_all()?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // On non-Linux, just open and sync the directory
+            let dirfd = OpenOptions::new().read(true).open(dir)?;
+            dirfd.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::header::HEADER_SIZE;
     use super::Wal;
     use crate::{tmpfs::NamedTempFile, Error};
+    use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
 
     fn create_temp_wal() -> Wal {
@@ -408,7 +425,13 @@ mod tests {
 
         wal.flush().expect("Failed to flush");
 
-        assert_eq!(wal.entry_count(), 3);
+        // Verify entries via replay
+        let entries: Vec<_> = wal
+            .replay()
+            .expect("Failed to replay")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Replay failed");
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]
@@ -442,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_corrupted_wal() {
-        let mut wal = create_temp_wal();
+        let wal = create_temp_wal();
 
         wal.append(b"key1", Some(b"value1"))
             .expect("Failed to append");
@@ -450,11 +473,15 @@ mod tests {
             .expect("Failed to append");
         wal.flush().expect("Failed to flush");
 
-        wal.file
-            .seek(SeekFrom::Start(HEADER_SIZE as u64 + 5))
-            .unwrap();
-        wal.file.write_all(b"garbage").unwrap();
-        wal.flush().unwrap();
+        // Corrupt the file by opening it separately
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(wal.path())
+                .expect("Failed to open WAL for corruption");
+            file.seek(SeekFrom::Start(HEADER_SIZE as u64 + 5)).unwrap();
+            file.write_all(b"garbage").unwrap();
+        }
 
         let replay_iter = wal.replay().expect("Failed to create replay iterator");
         let mut has_corruption = false;

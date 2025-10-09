@@ -8,7 +8,6 @@ pub const HEADER_SIZE: usize = 64;
 pub struct Header {
     pub magic: [u8; 8],
     pub version: u32,
-    pub entry_count: u64,
 }
 
 const MAGIC: &[u8; 8] = b"ASHDB\x00WL";
@@ -20,7 +19,6 @@ impl Header {
         Header {
             magic: *MAGIC,
             version: VERSION,
-            entry_count: 0,
         }
     }
 
@@ -81,9 +79,7 @@ impl Header {
         (&mut buf[8..12])
             .write_u32::<BigEndian>(self.version)
             .unwrap();
-        (&mut buf[12..20])
-            .write_u64::<BigEndian>(self.entry_count)
-            .unwrap();
+        // Remaining bytes are zero-padding
         buf
     }
 
@@ -92,13 +88,9 @@ impl Header {
         magic.copy_from_slice(&buf[0..8]);
 
         let version = (&buf[8..12]).read_u32::<BigEndian>()?;
-        let entry_count = (&buf[12..20]).read_u64::<BigEndian>()?;
+        // Ignore remaining bytes (previously entry_count, now unused)
 
-        let header = Self {
-            magic,
-            version,
-            entry_count,
-        };
+        let header = Self { magic, version };
         header.validate()?;
         Ok(header)
     }
@@ -110,8 +102,7 @@ mod tests {
 
     #[test]
     fn test_header_encoding_decoding() {
-        let mut header = Header::new();
-        header.entry_count = 42;
+        let header = Header::new();
 
         let encoded = header.encode();
         assert_eq!(encoded.len(), HEADER_SIZE);
@@ -125,7 +116,6 @@ mod tests {
         let mut buf = [0u8; HEADER_SIZE];
         buf[0..8].copy_from_slice(b"INVALID!");
         (&mut buf[8..12]).write_u32::<BigEndian>(1).unwrap();
-        (&mut buf[12..20]).write_u64::<BigEndian>(0).unwrap();
 
         let result = Header::decode(&buf);
         assert!(matches!(result, Err(Error::InvalidData(_))));
@@ -136,7 +126,6 @@ mod tests {
         let mut buf = [0u8; HEADER_SIZE];
         buf[0..8].copy_from_slice(b"ASHDB\x00WL");
         (&mut buf[8..12]).write_u32::<BigEndian>(999).unwrap();
-        (&mut buf[12..20]).write_u64::<BigEndian>(0).unwrap();
 
         let result = Header::decode(&buf);
         assert!(matches!(result, Err(Error::InvalidData(_))));
