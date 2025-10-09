@@ -7,9 +7,21 @@ use super::{
 };
 use crate::{config::LsmConfig, error::Result, flock::FileLock};
 
-use std::{fs, ops::RangeBounds, sync::Arc};
+use std::{fs, ops::RangeBounds, path::Path, sync::Arc};
 
 const LOCK_FILE: &str = "ashdb.lock";
+
+/// Construct path for a WAL file by ID.
+/// Format: `<dir>/wal/00000000.wal`
+pub(super) fn wal_path(dir: &Path, wal_id: u64) -> std::path::PathBuf {
+    dir.join("wal").join(format!("{:08}.wal", wal_id))
+}
+
+/// Construct path for an SSTable file by ID.
+/// Format: `<dir>/sst/00000000.sst`
+pub(super) fn sstable_path(dir: &Path, table_id: u64) -> std::path::PathBuf {
+    dir.join("sst").join(format!("{:08}.sst", table_id))
+}
 
 /// LSM Store with interior mutability
 pub struct LsmTree {
@@ -65,20 +77,18 @@ impl Store for LsmTree {
 
     fn set(&self, key: &[u8], value: Vec<u8>) -> Result<()> {
         loop {
-            let active = self.state.active_memtable.read().unwrap();
+            let active = self.state.active_memtable.load();
 
             match active.put(key.to_vec(), Some(value.clone())) {
                 Ok(_) => {
                     // Check if freeze needed
                     if active.size() >= self.config.max_memtable_size {
-                        drop(active); // Release read lock
                         self.freeze_active_memtable()?;
                     }
                     return Ok(());
                 }
                 Err(crate::Error::ReadOnly) => {
                     // Retry with new active memtable
-                    drop(active);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -88,7 +98,7 @@ impl Store for LsmTree {
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // Check active memtable
-        if let Some(value) = self.state.active_memtable.read().unwrap().get(key) {
+        if let Some(value) = self.state.active_memtable.load().get(key) {
             return Ok(value);
         }
 
@@ -119,9 +129,9 @@ impl Store for LsmTree {
             dyn DoubleEndedIterator<Item = Result<(Vec<u8>, Option<Vec<u8>>)>> + Send + Sync + 'a,
         >;
 
-        // Clone Arc to extend lifetime beyond lock
+        // Load Arc - no lock needed with ArcSwap
         let active = {
-            let active = self.state.active_memtable.read().unwrap();
+            let active = self.state.active_memtable.load();
             Arc::clone(active.memtable())
         };
 
@@ -168,20 +178,18 @@ impl Store for LsmTree {
 
     fn delete(&self, key: &[u8]) -> Result<()> {
         loop {
-            let active = self.state.active_memtable.read().unwrap();
+            let active = self.state.active_memtable.load();
 
             match active.delete(key.to_vec()) {
                 Ok(_) => {
                     // Check if freeze needed
                     if active.size() >= self.config.max_memtable_size {
-                        drop(active); // Release read lock
                         self.freeze_active_memtable()?;
                     }
                     return Ok(());
                 }
                 Err(crate::Error::ReadOnly) => {
                     // Retry with new active memtable
-                    drop(active);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -190,7 +198,7 @@ impl Store for LsmTree {
     }
 
     fn sync(&self) -> Result<()> {
-        let active = self.state.active_memtable.read().unwrap();
+        let active = self.state.active_memtable.load();
         active.sync()
     }
 }
@@ -211,12 +219,12 @@ impl LsmTree {
             new_wal_id,
         )?);
 
-        // Atomic swap
-        let old_active = {
-            let mut active = self.state.active_memtable.write().unwrap();
-            let old = active.freeze()?;
-            let _ = std::mem::replace(&mut *active, new_active);
-            old
+        // Freeze current active and atomically swap with new one
+        let frozen = {
+            let old = self.state.active_memtable.load();
+            let frozen_memtable = old.freeze()?;
+            self.state.active_memtable.swap(new_active);
+            frozen_memtable
         };
 
         // Add to frozen queue
@@ -224,7 +232,7 @@ impl LsmTree {
             .frozen_memtables
             .write()
             .unwrap()
-            .push_back(old_active);
+            .push_back(frozen);
 
         Ok(())
     }
@@ -257,40 +265,26 @@ impl LsmTree {
 
     /// Generate next WAL ID and construct its path
     pub(super) fn next_wal_path(&self) -> (u64, std::path::PathBuf) {
-        let wal_id = self.state.next_wal_id();
-        let path = self
-            .config
-            .dir
-            .join("wal")
-            .join(format!("{:08}.wal", wal_id));
-        (wal_id, path)
+        let id = self.state.next_wal_id();
+        let path = wal_path(&self.config.dir, id);
+        (id, path)
     }
 
     /// Generate next SSTable ID and construct its path
     pub(super) fn next_sstable_path(&self) -> (u64, std::path::PathBuf) {
-        let table_id = self.state.next_sstable_id();
-        let path = self
-            .config
-            .dir
-            .join("sst")
-            .join(format!("{:08}.sst", table_id));
-        (table_id, path)
+        let id = self.state.next_sstable_id();
+        let path = sstable_path(&self.config.dir, id);
+        (id, path)
     }
 
     /// Construct path for existing WAL by ID
     pub(super) fn wal_path(&self, wal_id: u64) -> std::path::PathBuf {
-        self.config
-            .dir
-            .join("wal")
-            .join(format!("{:08}.wal", wal_id))
+        wal_path(&self.config.dir, wal_id)
     }
 
     /// Construct path for existing SSTable by ID
     pub(super) fn sstable_path(&self, table_id: u64) -> std::path::PathBuf {
-        self.config
-            .dir
-            .join("sst")
-            .join(format!("{:08}.sst", table_id))
+        sstable_path(&self.config.dir, table_id)
     }
 
     /// Get current health metrics for monitoring and debugging
@@ -679,6 +673,47 @@ mod tests {
         assert_eq!(value, Some(b"test_value".to_vec()));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_file_naming_format() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Test WAL path format
+        let wal_path_0 = wal_path(temp_dir.path(), 0);
+        let wal_path_1 = wal_path(temp_dir.path(), 1);
+        let wal_path_999 = wal_path(temp_dir.path(), 999);
+
+        assert_eq!(
+            wal_path_0.file_name().unwrap().to_str().unwrap(),
+            "00000000.wal"
+        );
+        assert_eq!(
+            wal_path_1.file_name().unwrap().to_str().unwrap(),
+            "00000001.wal"
+        );
+        assert_eq!(
+            wal_path_999.file_name().unwrap().to_str().unwrap(),
+            "00000999.wal"
+        );
+
+        // Test SSTable path format
+        let sst_path_0 = sstable_path(temp_dir.path(), 0);
+        let sst_path_1 = sstable_path(temp_dir.path(), 1);
+        let sst_path_999 = sstable_path(temp_dir.path(), 999);
+
+        assert_eq!(
+            sst_path_0.file_name().unwrap().to_str().unwrap(),
+            "00000000.sst"
+        );
+        assert_eq!(
+            sst_path_1.file_name().unwrap().to_str().unwrap(),
+            "00000001.sst"
+        );
+        assert_eq!(
+            sst_path_999.file_name().unwrap().to_str().unwrap(),
+            "00000999.sst"
+        );
     }
 
     #[tokio::test]

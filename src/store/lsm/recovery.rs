@@ -73,7 +73,7 @@ fn levels_from_manifest_state(dir: &Path, state: &ManifestState) -> Result<Vec<L
         }
 
         for table_meta in &level_meta.tables {
-            let path = dir.join("sst").join(format!("{:08}.sst", table_meta.id));
+            let path = super::store::sstable_path(dir, table_meta.id);
             let table = Table::open(path.to_str().unwrap())?;
             levels[level_meta.level as usize].add_sstable(SSTable {
                 id: table_meta.id,
@@ -104,7 +104,7 @@ mod tests {
         // Should have empty levels and one active memtable
         assert!(state.levels.read().unwrap().is_empty());
         assert!(state.frozen_memtables.read().unwrap().is_empty());
-        assert_eq!(state.active_memtable.read().unwrap().size(), 0);
+        assert_eq!(state.active_memtable.load().size(), 0);
 
         Ok(())
     }

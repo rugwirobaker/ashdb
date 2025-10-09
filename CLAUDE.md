@@ -47,6 +47,7 @@ AshDB is an SQLite-inspired embedded database for time-series data, built in Rus
 - List the files/modules will be affected before hand.
 - Run `cargo check`, `cargo clippy`, `cargo fmt` in that order.
 - Make sure we have tests covering this change.
+- Output perfomance result files(perf, strace, flamegraph, ...) to perf-data so we can properly git ignore them
 
 ## Architecture
 

@@ -48,8 +48,10 @@ use super::super::sstable::{block, table};
 use super::super::wal::Wal;
 use crate::error::Result;
 use crate::Error;
+
 use crossbeam_skiplist::SkipMap;
-use std::sync::{Arc, RwLock};
+
+use std::sync::Arc;
 use std::{
     ops::RangeBounds,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -62,7 +64,7 @@ use std::{
 #[derive(Debug)]
 pub struct Memtable {
     data: Arc<SkipMap<Vec<u8>, Option<Vec<u8>>>>,
-    wal: Arc<RwLock<Wal>>,
+    wal: Arc<Wal>,
     wal_id: u64,
     size: AtomicUsize,
     frozen: AtomicBool,
@@ -83,7 +85,7 @@ impl Clone for Memtable {
 impl Memtable {
     /// Creates a new empty Memtable with a new WAL.
     pub fn new(wal_path: &str, wal_id: u64) -> Result<Self> {
-        let wal = Arc::new(RwLock::new(Wal::new(wal_path)?));
+        let wal = Arc::new(Wal::new(wal_path)?);
         Ok(Self {
             data: Arc::new(SkipMap::new()),
             wal,
@@ -106,7 +108,7 @@ impl Memtable {
             data.insert(key, value);
         }
 
-        let wal = Arc::new(RwLock::new(wal));
+        let wal = Arc::new(wal);
         Ok(Self {
             data,
             wal,
@@ -125,7 +127,7 @@ impl Memtable {
         let value_size = value.as_ref().map_or(0, |v| v.len());
         let entry_size = key_size + value_size;
 
-        self.wal.write().unwrap().append(&key, value.as_deref())?;
+        self.wal.append(&key, value.as_deref())?;
         // Insert into the Memtable
         self.data.insert(key, value);
         // Update Memtable size
@@ -165,7 +167,7 @@ impl Memtable {
         self.wal_id
     }
 
-    pub fn wal(&self) -> &Arc<RwLock<Wal>> {
+    pub fn wal(&self) -> &Arc<Wal> {
         &self.wal
     }
 
@@ -180,7 +182,7 @@ impl Memtable {
 
     // sync synchronizes the Memtable's WAL.
     pub fn sync(&self) -> Result<()> {
-        self.wal.write().unwrap().flush()
+        self.wal.flush()
     }
 
     pub fn flush(&self, table: &mut table::Table<table::Writable>) -> Result<()> {
@@ -513,7 +515,7 @@ mod tests {
         memtable.sync().expect("Failed to sync");
 
         // WAL should contain the same data as the Memtable
-        let wal = memtable.wal.read().unwrap().replay().unwrap();
+        let wal = memtable.wal.replay().unwrap();
         for (i, entry) in wal.enumerate() {
             let (key, value) = entry.unwrap();
             match i {
